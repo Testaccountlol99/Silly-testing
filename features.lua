@@ -207,13 +207,9 @@ startAimbot = function()
         local adaptiveFactor = Settings.AdaptivePrediction
             and (velScale * stability) or 1.0
 
-        -- Minimum prediction floor: even at 0 ping, rendering + input pipeline
-        -- introduces ~1-3 frames of latency.  This ensures we always lead by
-        -- at least MinPredictionTime seconds.
         local basePing = mmax(cachedPing, Settings.MinPredictionTime)
 
         -- Latency penalty: smoothly reduces prediction horizon at high ping
-        -- to avoid overshoot from extrapolating too far into uncertain futures.
         local latencyPenalty = 1.0
         if basePing > 0.1 then
             if basePing < 0.15 then
@@ -229,33 +225,20 @@ startAimbot = function()
             * Settings.PredictionFactor
 
         -- ── Kalman extrapolation (full jerk-model Taylor series) ──────────────
-        -- This replaces the old manual pos + vel*t + 0.5*a*t² formula.
-        -- The jerk model natively gives: pos + vel*t + 0.5*accel*t² + (1/6)*jerk*t³
-        -- which accurately tracks parabolic arcs (jump/fall) and snap direction
-        -- changes (strafe/bhop) without needing to clamp or damp the accel term.
         local predictedRootPos = Settings.Prediction
             and kalmanExtrapolate(predTime)
             or  rootPos
 
         -- ── Camera compensation ───────────────────────────────────────────────
-        -- When the local player is moving (strafing, falling, bhopping), the
-        -- camera will be at a different position by the time the shot registers.
-        -- Shift the aim point by the camera's own velocity × prediction time
-        -- to compensate for this relative motion.
         local camCompensation = ZERO3
         if Settings.Prediction then
             local camSpeed = camVel.Magnitude
-            -- Only compensate when we're actually moving meaningfully
-            -- (avoids jitter when standing still).
             if camSpeed > 2.0 then
                 camCompensation = camVel * predTime * 0.65
-                -- 0.65 factor: partial compensation prevents overcorrection
-                -- since camera velocity is slightly delayed (EMA smoothed).
             end
         end
 
         -- ── Final aim position ────────────────────────────────────────────────
-        -- predicted root + smoothed part offset + camera compensation + error
         local aimPos = predictedRootPos + partOffset + camCompensation
 
         if Settings.Mode == "Legit" then
@@ -272,19 +255,13 @@ startAimbot = function()
             local hitPart = preShotCheck.Instance
             local hitChar = hitPart:FindFirstAncestorOfClass("Model")
             if hitChar == targetPlayer.Character and hitPart ~= targetPart then
-                -- Blend back toward the actual current part position if the
-                -- predicted position would hit the wrong body part / geometry.
                 aimPos = aimPos:Lerp(targetPart.Position, 0.6)
             elseif hitChar ~= targetPlayer.Character then
-                -- Prediction overshoots into a wall/obstacle — snap closer to
-                -- the raw target position to stay on the visible body.
                 aimPos = aimPos:Lerp(targetPart.Position, 0.85)
             end
         end
 
         -- ── Spring-damper smoothing ───────────────────────────────────────────
-        -- Retained in BOTH modes: Blatant gets the spring + micro-jitter,
-        -- Legit gets spring + jitter + humanised error (from above).
         if Spr.pos == nil then
             Spr.pos = camPos + camCF.LookVector * 200
         end
@@ -295,7 +272,6 @@ startAimbot = function()
 
         local springForce = (aimPos - Spr.pos) * Spr.k
                           - Spr.vel * Spr.d
-        -- ±3% jitter simulates natural wrist inconsistency (both modes)
         springForce = springForce * (1 + (mrand() - 0.5) * 0.06)
 
         Spr.vel = Spr.vel + springForce * safeDt
@@ -309,9 +285,12 @@ end
 -- [12b] ESP STEP  (independent of aimbot — own connection)
 -- ============================================================
 
+-- Pre-baked sign table for the 8 corners of an axis-aligned bounding box.
+-- Stored as flat scalar pairs rather than sub-tables to avoid two levels of
+-- table indexing per corner in the inner loop.
 local CORNER_SIGNS = {
-    { 1,  1,  1}, { 1,  1, -1}, { 1, -1,  1}, { 1, -1, -1},
-    {-1,  1,  1}, {-1,  1, -1}, {-1, -1,  1}, {-1, -1, -1},
+     1, 1, 1,    1, 1,-1,    1,-1, 1,    1,-1,-1,
+    -1, 1, 1,   -1, 1,-1,   -1,-1, 1,   -1,-1,-1,
 }
 
 local espConnection = nil
@@ -343,7 +322,8 @@ startEsp = function()
         local teamCheck   = Settings.EspTeamCheck
         local teamColors  = Settings.EspTeamColors
         local myTeam      = LocalPlayer.Team
-        local camPos      = Camera.CFrame.Position
+        local camCF       = Camera.CFrame
+        local camPos      = camCF.Position
 
         if not playerEspOn then
             for _, entry in ipairs(espRenderList) do
@@ -357,10 +337,16 @@ startEsp = function()
             local pl    = entry.pl
             local cc    = entry.cc
 
+            -- Guard: if already hidden and team-skipped, avoid redundant
+            -- Drawing property writes by tracking dirty state in cc.espHidden.
             if teamCheck and myTeam and pl.Team == myTeam then
-                espHidePlayer(pl)
+                if not cc.espHidden then
+                    espHidePlayer(pl)
+                    cc.espHidden = true
+                end
                 continue
             end
+            cc.espHidden = false
 
             local root = cc.root
             if not root then continue end
@@ -374,35 +360,54 @@ startEsp = function()
 
             if espType == "Box" then
                 if rootVisible then
-                    -- Compute screen-space AABB using only the character's direct
-                    -- BasePart children.  Accessories (Accessory > Handle) and
-                    -- held tools (Tool > Handle) are parented inside their own
-                    -- sub-Model/Accessory container, so their Handle parts do NOT
-                    -- appear as direct children here — giving a body-only box.
+                    -- Use cc.bodyParts (cached at character spawn, kept in sync via
+                    -- ChildAdded/ChildRemoved) instead of calling GetChildren() per frame.
+                    -- GetChildren() allocates a new Lua table on every call; caching
+                    -- eliminates that allocation entirely for the ESP hot path.
+                    local bodyParts = cc.bodyParts
                     local minSX, minSY =  mhuge,  mhuge
                     local maxSX, maxSY = -mhuge, -mhuge
                     local frontCount   = 0
-                    for _, part in ipairs(cc.ch:GetChildren()) do
-                        if part:IsA("BasePart") then
-                            local cf   = part.CFrame
-                            local size = part.Size
-                            local hx   = size.X * 0.5
-                            local hy   = size.Y * 0.5
-                            local hz   = size.Z * 0.5
-                            for _, s in ipairs(CORNER_SIGNS) do
-                                local wp = cf:PointToWorldSpace(
-                                    Vector3.new(s[1]*hx, s[2]*hy, s[3]*hz))
-                                local sp = Camera:WorldToViewportPoint(wp)
-                                if sp.Z > 0 then
-                                    frontCount = frontCount + 1
-                                    if sp.X < minSX then minSX = sp.X end
-                                    if sp.X > maxSX then maxSX = sp.X end
-                                    if sp.Y < minSY then minSY = sp.Y end
-                                    if sp.Y > maxSY then maxSY = sp.Y end
-                                end
+
+                    for _, part in ipairs(bodyParts) do
+                        local cf   = part.CFrame
+                        local size = part.Size
+                        local hx   = size.X * 0.5
+                        local hy   = size.Y * 0.5
+                        local hz   = size.Z * 0.5
+
+                        -- Precompute the CFrame's rotation columns as scalars.
+                        -- This lets us compute each corner's world position using
+                        -- pure scalar arithmetic, avoiding cf:PointToWorldSpace()
+                        -- which would create an intermediate Vector3 per corner.
+                        -- We still need one Vector3.new per corner for
+                        -- WorldToViewportPoint, but the intermediate allocation
+                        -- from PointToWorldSpace is eliminated.
+                        local px = cf.X;  local py = cf.Y;  local pz = cf.Z
+                        local rx = cf.XVector.X; local ry = cf.XVector.Y; local rz = cf.XVector.Z
+                        local ux = cf.YVector.X; local uy = cf.YVector.Y; local uz = cf.YVector.Z
+                        local lx = cf.ZVector.X; local ly = cf.ZVector.Y; local lz = cf.ZVector.Z
+
+                        local cs = CORNER_SIGNS
+                        for ci = 1, 24, 3 do
+                            local sx = cs[ci] * hx
+                            local sy = cs[ci+1] * hy
+                            local sz = cs[ci+2] * hz
+                            local sp = Camera:WorldToViewportPoint(Vector3.new(
+                                px + rx*sx + ux*sy + lx*sz,
+                                py + ry*sx + uy*sy + ly*sz,
+                                pz + rz*sx + uz*sy + lz*sz
+                            ))
+                            if sp.Z > 0 then
+                                frontCount = frontCount + 1
+                                if sp.X < minSX then minSX = sp.X end
+                                if sp.X > maxSX then maxSX = sp.X end
+                                if sp.Y < minSY then minSY = sp.Y end
+                                if sp.Y > maxSY then maxSY = sp.Y end
                             end
                         end
                     end
+
                     if frontCount > 0 and maxSY > minSY then
                         local box = getEspBox(pl)
                         box.Size     = newV2(maxSX - minSX, maxSY - minSY)
@@ -441,7 +446,9 @@ startEsp = function()
 
             local head = cc.head
             if textOn and head then
-                local headTop = head.Position + Vector3.new(0, head.Size.Y * 0.5, 0)
+                -- cc.headHalfY is precomputed at character spawn to avoid reading
+                -- head.Size.Y every frame per player.
+                local headTop = head.Position + Vector3.new(0, cc.headHalfY, 0)
                 local sp, onScreen = Camera:WorldToViewportPoint(headTop)
 
                 if onScreen and sp.Z > 0 then
