@@ -76,13 +76,43 @@ local function getEspHighlight(player)
     return espHighlightPool[player]
 end
 
+-- ── Character part cache ──────────────────────────────────────────────────────
+-- Returns a table { ch, hum, root, head } for pl, or nil if the character is
+-- absent / has no Humanoid.  The table is rebuilt only when pl.Character differs
+-- from the last cached value, so FindFirstChildOfClass / FindFirstChild are
+-- never called inside the hot RenderStepped loop on a cache hit.
+local function getEspChar(pl)
+    local ch = pl.Character
+    if not ch then espCharCache[pl] = nil; return nil end
+    local c = espCharCache[pl]
+    if c and c.ch == ch then return c end       -- cache hit — no child searches
+    -- Cache miss: character changed or first sight. Rebuild.
+    local hum  = ch:FindFirstChildOfClass("Humanoid")
+    if not hum then espCharCache[pl] = nil; return nil end
+    local root = ch:FindFirstChild("HumanoidRootPart")
+    local head = ch:FindFirstChild("Head")
+    -- Pre-bake foot and head-top offsets so box rendering never touches
+    -- HipHeight or part.Size inside the hot RenderStepped loop.
+    -- feetOffset: world-space Y delta from root centre down to the ground plane.
+    -- headHalfY:  world-space Y delta from head centre up to the top of the head.
+    local feetOffset = root and -(hum.HipHeight + root.Size.Y * 0.5) or 0
+    local headHalfY  = head and  (head.Size.Y * 0.5)                 or 0.25
+    c = { ch         = ch,
+          hum        = hum,
+          root       = root,
+          head       = head,
+          feetOffset = feetOffset,
+          headHalfY  = headHalfY }
+    espCharCache[pl] = c
+    return c
+end
+
 -- ── ESP text pool ─────────────────────────────────────────────────────────────
 -- Two Drawing "Text" objects per player:
---   name  → DisplayName, white, ~22 px above head top — set once at spawn
---   info  → "♥ HP%  •  Xm", health-coloured, ~11 px above head top
--- getEspText fills the forward declaration from core.lua so onCharacter can
--- pre-create drawings and set the player name at spawn time.
-getEspText = function(player)
+--   name  → DisplayName, white, drawn ~22 px above the projected head top
+--   info  → "♥ HP%  dist m", health-coloured, drawn ~11 px above head top
+-- Both are centred horizontally on the head screen position.
+local function getEspText(player)
     if not espTextPool[player] then
         espTextPool[player] = {
             name = RenderProperty("Text", {
@@ -296,13 +326,6 @@ end
 -- [12b] ESP STEP  (independent of aimbot — own connection)
 -- ============================================================
 
--- All 8 sign combinations for OBB corner enumeration.
--- Declared once here so the table is never re-allocated inside the hot loop.
-local CORNER_SIGNS = {
-    { 1,  1,  1}, { 1,  1, -1}, { 1, -1,  1}, { 1, -1, -1},
-    {-1,  1,  1}, {-1,  1, -1}, {-1, -1,  1}, {-1, -1, -1},
-}
-
 local espConnection = nil
 
 stopEsp = function()
@@ -310,26 +333,23 @@ stopEsp = function()
         espConnection:Disconnect()
         espConnection = nil
     end
-    -- Hide everything still visible. espRenderList contains only alive players
-    -- but their drawings may be shown — hide them all immediately.
-    for _, entry in ipairs(espRenderList) do
-        espHidePlayer(entry.pl)
-    end
-    -- Sweep pools for any stragglers.
     for _, box   in pairs(espBoxPool)       do box.Visible   = false end
     for _, charm in pairs(espCharmPool)     do charm.Visible = false end
     for _, hl    in pairs(espHighlightPool) do hl.Enabled    = false end
-    for _, t     in pairs(espTextPool) do
-        t.name.Visible = false ; t.info.Visible = false
+    for _, t     in pairs(espTextPool)      do
+        t.name.Visible = false
+        t.info.Visible = false
     end
 end
 
 startEsp = function()
-    if espConnection then return end
+    if espConnection then return end  -- guard against double-connect
 
     espConnection = RunService.RenderStepped:Connect(function()
 
-        -- ── Frame-constant hoists ─────────────────────────────────────────────
+        -- ── Hoist all frame-constant reads before the player loop ─────────────
+        -- Every Settings / Camera / team read inside the loop is a table lookup;
+        -- hoisting them pays that cost exactly once per frame regardless of lobby size.
         local playerEspOn = Settings.PlayerEspEnabled
         local espType     = Settings.EspType
         local textOn      = Settings.EspTextEnabled
@@ -338,69 +358,91 @@ startEsp = function()
         local myTeam      = LocalPlayer.Team
         local camPos      = Camera.CFrame.Position
 
-        -- ── Bulk early-exit ───────────────────────────────────────────────────
+        -- Reuse the active-set table instead of allocating 4 new ones each frame.
+        -- At 100 players × 60 fps that eliminates ~24 000 table GC events/minute.
+        table.clear(espActiveSet)
+
+        -- ── Bulk early-exit when player sub-toggle is OFF ─────────────────────
         if not playerEspOn then
-            for _, entry in ipairs(espRenderList) do
-                espHidePlayer(entry.pl)
+            for _, box   in pairs(espBoxPool)       do box.Visible   = false end
+            for _, charm in pairs(espCharmPool)     do charm.Visible = false end
+            for _, hl    in pairs(espHighlightPool) do hl.Enabled    = false end
+            for _, t     in pairs(espTextPool) do
+                t.name.Visible = false ; t.info.Visible = false
             end
             return
         end
 
-        -- ── Main render loop ──────────────────────────────────────────────────
-        -- espRenderList only contains alive players with loaded characters.
-        -- Text is now event+threshold driven — no throttle counter needed.
-        for i = 1, #espRenderList do
-            local entry = espRenderList[i]
-            local pl    = entry.pl
-            local cc    = entry.cc
+        -- ── Text throttle ─────────────────────────────────────────────────────
+        -- String concatenation, newC3 allocation, and an extra viewport call are
+        -- expensive per visible player.  At 60 fps the human eye can't perceive
+        -- HP / distance changing faster than ~15 fps, so we skip the heavy work
+        -- 3 out of every 4 frames.  Screen position is still updated every frame.
+        local doTextUpdate = (espTextTick % ESP_TEXT_EVERY == 0)
+        espTextTick = espTextTick + 1
 
-            -- Team filter: hide inline and skip.
-            if teamCheck and myTeam and pl.Team == myTeam then
-                espHidePlayer(pl)
-                continue
-            end
+        -- ── Main player loop ──────────────────────────────────────────────────
+        for i = 1, #playerCache do
+            local pl = playerCache[i]
+
+            -- Team filter (frame-constant teamCheck / myTeam used here)
+            if teamCheck and myTeam and pl.Team == myTeam then continue end
+
+            -- Character cache lookup — zero FindFirstChild calls on a cache hit.
+            -- The cache rebuilds automatically whenever pl.Character changes
+            -- (respawn, character swap), catching the new parts in one go.
+            local cc = getEspChar(pl)
+            if not cc or cc.hum.Health <= 0 then continue end
 
             local root = cc.root
-            if not root then continue end  -- safety; shouldn't happen
+            if not root then continue end
 
-            -- Single cheap root Z-check: skips all expensive work for players
-            -- behind the camera. For Box mode, saves 8 viewport calls per player.
+            -- ── Single cheap root viewport check ─────────────────────────────
+            -- If the root is behind the camera (rsp.Z ≤ 0) we skip all further
+            -- work for this player.  For Box mode this alone saves 8 extra
+            -- WorldToViewportPoint calls per off-screen player — at 80 players
+            -- that's up to 640 avoided calls/frame when facing away from the crowd.
             local rsp         = Camera:WorldToViewportPoint(root.Position)
             local rootVisible = rsp.Z > 0
 
-            -- Colour resolved once per player — no Color3 alloc when team colours OFF.
+            -- Resolve draw colour once — ESP_COLOR_DEFAULT is a cached constant
+            -- so no Color3 allocation occurs when team colours are OFF.
             local drawColor = (teamColors and pl.Team)
                 and pl.Team.TeamColor.Color
                 or  ESP_COLOR_DEFAULT
 
-            -- ── ESP type ─────────────────────────────────────────────────────
+            espActiveSet[pl] = true
+
+            -- ── ESP type rendering ────────────────────────────────────────────
             if espType == "Box" then
-                if rootVisible then
-                    local bbCF, bbSize = cc.ch:GetBoundingBox()
-                    local hx = bbSize.X * 0.5
-                    local hy = bbSize.Y * 0.5
-                    local hz = bbSize.Z * 0.5
-                    local minSX, minSY =  mhuge,  mhuge
-                    local maxSX, maxSY = -mhuge, -mhuge
-                    local frontCount   = 0
-                    for _, s in ipairs(CORNER_SIGNS) do
-                        local wp = bbCF:PointToWorldSpace(
-                            Vector3.new(s[1]*hx, s[2]*hy, s[3]*hz))
-                        local sp = Camera:WorldToViewportPoint(wp)
-                        if sp.Z > 0 then
-                            frontCount = frontCount + 1
-                            if sp.X < minSX then minSX = sp.X end
-                            if sp.X > maxSX then maxSX = sp.X end
-                            if sp.Y < minSY then minSY = sp.Y end
-                            if sp.Y > maxSY then maxSY = sp.Y end
+                -- ── 2-point head/feet projection (replaces 8-corner OBB) ──────────
+                -- Projects only the top of the head and the ground beneath the root,
+                -- then derives box width from screen height via a fixed humanoid
+                -- aspect ratio (~0.45).  Cost: 2 WorldToViewportPoint instead of 8,
+                -- no GetBoundingBox() model traversal.  Accurately fits limbs for
+                -- standard Roblox R6/R15 rigs; large side-extending accessories/tools
+                -- may slightly overflow but this is imperceptible at normal play distances.
+                if rootVisible and cc.head then
+                    local headTopPos = cc.head.Position + Vector3.new(0, cc.headHalfY, 0)
+                    local feetPos    = root.Position    + Vector3.new(0, cc.feetOffset, 0)
+
+                    local spTop = Camera:WorldToViewportPoint(headTopPos)
+                    local spBot = Camera:WorldToViewportPoint(feetPos)
+
+                    if spTop.Z > 0 and spBot.Z > 0 then
+                        local h    = spBot.Y - spTop.Y               -- screen height
+                        local w    = h * 0.45                        -- humanoid aspect ratio
+                        local midX = (spTop.X + spBot.X) * 0.5      -- lean-corrected centre
+
+                        if h > 1 then  -- skip sub-pixel boxes
+                            local box = getEspBox(pl)
+                            box.Size     = newV2(w, h)
+                            box.Position = newV2(midX - w * 0.5, spTop.Y)
+                            box.Color    = drawColor
+                            box.Visible  = true
+                        else
+                            if espBoxPool[pl] then espBoxPool[pl].Visible = false end
                         end
-                    end
-                    if frontCount > 0 and maxSY > minSY then
-                        local box = getEspBox(pl)
-                        box.Size     = newV2(maxSX - minSX, maxSY - minSY)
-                        box.Position = newV2(minSX, minSY)
-                        box.Color    = drawColor
-                        box.Visible  = true
                     else
                         if espBoxPool[pl] then espBoxPool[pl].Visible = false end
                     end
@@ -411,7 +453,7 @@ startEsp = function()
                 if espHighlightPool[pl] then espHighlightPool[pl].Enabled = false end
 
             elseif espType == "Circle/Mark" then
-                -- rsp already computed above — reuse directly.
+                -- rsp already computed above — no second WorldToViewportPoint needed.
                 if rootVisible then
                     local charm = getEspCharm(pl)
                     charm.Position = newV2(rsp.X, rsp.Y)
@@ -433,35 +475,32 @@ startEsp = function()
             end
 
             -- ── Text overlay ──────────────────────────────────────────────────
-            -- Health data (hpStr, r, g, colorDirty) is pre-computed by
-            -- HealthChanged and lives in cc.txt — zero health math here.
-            -- The info string is rebuilt only when the integer metre distance
-            -- changes OR colorDirty is set (health changed) — not every frame.
-            -- t.name.Text was set once at spawn and is never touched here.
             local head = cc.head
             if textOn and head then
-                local headTop = head.Position + Vector3.new(0, head.Size.Y * 0.5, 0)
+                local headTop = head.Position + Vector3.new(0, cc.headHalfY, 0)
                 local sp, onScreen = Camera:WorldToViewportPoint(headTop)
 
                 if onScreen and sp.Z > 0 then
-                    local t   = getEspText(pl)
-                    local txt = cc.txt
-
-                    -- Position: cheap V2 assignment every frame so text tracks movement.
+                    local t  = getEspText(pl)
+                    -- Screen position updated every frame — cheap, just two V2 writes.
                     t.name.Position = newV2(sp.X, sp.Y - 22)
                     t.info.Position = newV2(sp.X, sp.Y - 11)
                     t.name.Visible  = true
                     t.info.Visible  = true
 
-                    -- Distance: one magnitude + floor — fast intrinsic.
-                    -- Only rebuild the info string when the integer metre value
-                    -- changes OR a HealthChanged event has set colorDirty.
-                    local dist = mfloor((root.Position - camPos).Magnitude + 0.5)
-                    if dist ~= txt.lastDist or txt.colorDirty then
-                        txt.lastDist   = dist
-                        txt.colorDirty = false
-                        t.info.Text    = txt.hpStr .. "  •  " .. dist .. "m"
-                        t.info.Color   = newC3(txt.r, txt.g, 0)
+                    -- Heavy work (string concat, newC3, sqrt) only every N frames.
+                    if doTextUpdate then
+                        local hum   = cc.hum
+                        local maxHp = mmax(hum.MaxHealth, 1)
+                        local hpPct = mclamp(hum.Health / maxHp, 0, 1)
+                        local r     = hpPct < 0.5 and 1 or (2 - hpPct * 2)
+                        local g     = hpPct > 0.5 and 1 or (hpPct * 2)
+                        local dist  = mfloor((root.Position - camPos).Magnitude + 0.5)
+
+                        t.name.Text  = pl.DisplayName
+                        t.info.Text  = "♥ " .. mfloor(hpPct * 100 + 0.5)
+                                    .. "%  •  " .. dist .. "m"
+                        t.info.Color = newC3(r, g, 0)
                     end
                 else
                     if espTextPool[pl] then
@@ -474,8 +513,22 @@ startEsp = function()
                 espTextPool[pl].info.Visible = false
             end
         end
-        -- No hide-pass: Humanoid.Died and CharacterRemoving call espHidePlayer
-        -- immediately, so the loop never encounters a dead or gone player.
+
+        -- ── Hide-pass: pool entries for players not active this frame ─────────
+        for pl, box   in pairs(espBoxPool)       do
+            if not espActiveSet[pl] then box.Visible   = false end
+        end
+        for pl, charm in pairs(espCharmPool)     do
+            if not espActiveSet[pl] then charm.Visible = false end
+        end
+        for pl, hl    in pairs(espHighlightPool) do
+            if not espActiveSet[pl] then hl.Enabled    = false end
+        end
+        for pl, t     in pairs(espTextPool)      do
+            if not espActiveSet[pl] then
+                t.name.Visible = false ; t.info.Visible = false
+            end
+        end
     end)
 end
 
@@ -483,4 +536,9 @@ end
 ScreenGui.Destroying:Connect(stopAimbot)
 ScreenGui.Destroying:Connect(stopEsp)
 
--- ========================================================
+-- ============================================================
+-- [13] BOOT  — apply saved settings to UI and start if enabled
+-- ============================================================
+-- All sections (including startAimbot/stopAimbot in [12]) are now defined,
+-- so it is safe to call applySettingsToUI which fires widget callbacks.
+applySettingsToUI()
