@@ -257,8 +257,11 @@ local function setupEspPlayer(pl)
         }
         espCharCache[pl] = cc
 
-        local t = getEspText(pl)
-        t.name.Text = pl.DisplayName
+        -- NOTE: getEspText is NOT called here.  onCharacter runs via task.spawn
+        -- during core.lua's initialisation; for players who already have a character
+        -- the WaitForChild calls above return immediately and execution reaches here
+        -- before features.lua has been executed — getEspText is still nil.
+        -- The display name is initialised lazily in the ESP render loop instead.
 
         local function onHealth(newHealth)
             local maxHp = mmax(hum.MaxHealth, 1)

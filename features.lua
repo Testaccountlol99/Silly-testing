@@ -455,6 +455,14 @@ startEsp = function()
                     local t   = getEspText(pl)
                     local txt = cc.txt
 
+                    -- Set the player name once (lazily) the first time the text
+                    -- object is used.  This replaces the onCharacter initialisation
+                    -- that was removed to fix the "attempt to call a nil value" crash
+                    -- caused by getEspText being called before features.lua loaded.
+                    if t.name.Text == "" then
+                        t.name.Text = pl.DisplayName
+                    end
+
                     t.name.Position = newV2(sp.X, sp.Y - 22)
                     t.info.Position = newV2(sp.X, sp.Y - 11)
                     t.name.Visible  = true
