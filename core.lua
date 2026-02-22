@@ -179,43 +179,183 @@ local espCharmPool     = {}   -- [player] = Drawing "Circle" object (Circle/Mark
 local espHighlightPool = {}   -- [player] = Highlight instance (Charm mode)
 local espTextPool      = {}   -- [player] = { name=Drawing.Text, info=Drawing.Text }
 
--- ── ESP optimisation state ────────────────────────────────────────────────────
--- Single Color3 constant for the default orange tint.  Avoids a newC3() call
--- per player per frame when EspTeamColors is OFF.
-local ESP_COLOR_DEFAULT = Color3.fromRGB(255, 69, 0)
+-- ── ESP constants ─────────────────────────────────────────────────────────────
+local ESP_COLOR_DEFAULT = Color3.fromRGB(255, 69, 0)  -- avoids alloc per frame
 
--- Reused "which players were rendered this frame" table.
--- Cleared with table.clear() at the top of each RenderStepped so the GC
--- never sees 4 fresh table allocations every frame.
-local espActiveSet = {}
+-- ── ESP render list (event-driven) ───────────────────────────────────────────
+-- Only players who are currently alive with a loaded character live here.
+-- CharacterAdded adds entries; Humanoid.Died and CharacterRemoving remove them.
+-- The RenderStepped loop iterates ONLY this list — no health checks, no
+-- FindFirstChild calls, no hide-pass for dead/gone players needed.
+local espRenderList  = {}   -- [i] = { pl=Player, cc={ ch, hum, root, head, txt } }
+local espCharCache   = {}   -- [player] = cc  (same table as renderList entry)
+local espPlayerConns = {}   -- [player] = { charAddedConn, charRemovingConn, humConn, healthConn }
 
--- Per-player character part cache { ch, hum, root, head }.
--- Rebuilt only when pl.Character changes, so FindFirstChildOfClass /
--- FindFirstChild are never called inside the hot render loop.
-local espCharCache = {}
+-- Forward-declared: body defined in features.lua after Drawing system is set up.
+-- onCharacter calls this to pre-create text drawings at spawn time so the
+-- render loop never needs to build or set them from scratch.
+local getEspText
 
--- Text throttle: label content (string concat, Color3 alloc, viewport math)
--- is expensive and 60 fps resolution is imperceptible — update every N frames.
-local espTextTick    = 0
-local ESP_TEXT_EVERY = 4   -- ~15 fps text refresh at 60 fps
+-- ── Helpers ───────────────────────────────────────────────────────────────────
+-- Hide all ESP drawings for one player immediately.
+local function espHidePlayer(pl)
+    if espBoxPool[pl]       then espBoxPool[pl].Visible       = false end
+    if espCharmPool[pl]     then espCharmPool[pl].Visible     = false end
+    if espHighlightPool[pl] then espHighlightPool[pl].Enabled = false end
+    if espTextPool[pl] then
+        espTextPool[pl].name.Visible = false
+        espTextPool[pl].info.Visible = false
+    end
+end
 
+-- Swap-remove player from espRenderList in O(1).
+local function espRemoveFromList(pl)
+    for i = 1, #espRenderList do
+        if espRenderList[i].pl == pl then
+            espRenderList[i] = espRenderList[#espRenderList]
+            espRenderList[#espRenderList] = nil
+            return
+        end
+    end
+end
+
+-- Fully destroy all pool objects for a player and free memory.
+local function espDestroyPools(pl)
+    if espBoxPool[pl] then
+        pcall(function() espBoxPool[pl]:Remove() end)
+        espBoxPool[pl] = nil
+    end
+    if espCharmPool[pl] then
+        pcall(function() espCharmPool[pl]:Remove() end)
+        espCharmPool[pl] = nil
+    end
+    if espHighlightPool[pl] then
+        pcall(function() espHighlightPool[pl]:Destroy() end)
+        espHighlightPool[pl] = nil
+    end
+    if espTextPool[pl] then
+        pcall(function() espTextPool[pl].name:Remove() end)
+        pcall(function() espTextPool[pl].info:Remove() end)
+        espTextPool[pl] = nil
+    end
+end
+
+-- ── Per-player event wiring ───────────────────────────────────────────────────
+-- Sets up CharacterAdded / CharacterRemoving / Humanoid.Died for one player.
+-- Called for every existing player at startup and for each PlayerAdded.
+local function setupEspPlayer(pl)
+    if pl == LocalPlayer then return end
+
+    local state = {}  -- holds the three live connections for this player
+
+    local function onCharacter(ch)
+        -- Disconnect previous per-character connections if the player respawned.
+        if state.humConn    then state.humConn:Disconnect();    state.humConn    = nil end
+        if state.healthConn then state.healthConn:Disconnect(); state.healthConn = nil end
+
+        -- Humanoid may not be replicated yet — wait briefly rather than poll.
+        local hum = ch:WaitForChild("Humanoid", 5)
+        if not hum then return end  -- malformed character; skip
+
+        -- Verify the character hasn't already been removed while we waited.
+        if pl.Character ~= ch then return end
+
+        local cc = {
+            ch   = ch,
+            hum  = hum,
+            root = ch:FindFirstChild("HumanoidRootPart"),
+            head = ch:FindFirstChild("Head"),
+            -- ── Text state ──────────────────────────────────────────────────
+            -- Pre-computed per-player text data so the render loop does zero
+            -- health math, zero string building, and zero Color3 allocs except
+            -- when health actually changes or the integer distance changes.
+            txt = {
+                hpStr      = "",     -- "♥ 100%" — rebuilt by HealthChanged
+                r          = 0,      -- pre-computed colour components
+                g          = 1,
+                lastDist   = -1,     -- last integer distance; -1 forces first build
+                colorDirty = true,   -- true whenever health changed since last rebuild
+            },
+        }
+        espCharCache[pl] = cc
+
+        -- Pre-create text drawings and set the player's name immediately.
+        -- Name is static for the session — setting it once here means the
+        -- render loop never needs to touch t.name.Text at all.
+        local t = getEspText(pl)
+        t.name.Text = pl.DisplayName
+
+        -- ── HealthChanged ────────────────────────────────────────────────────
+        -- Fires whenever Health changes. We pre-compute the health string and
+        -- colour components here so the render loop is just a table read.
+        -- newC3 is called only inside the render loop when it also needs to
+        -- rebuild the info string (dist changed OR colorDirty), not here —
+        -- that way one alloc covers both changes in the same frame.
+        local function onHealth(newHealth)
+            local maxHp = mmax(hum.MaxHealth, 1)
+            local hpPct = mclamp(newHealth / maxHp, 0, 1)
+            cc.txt.r          = hpPct < 0.5 and 1 or (2 - hpPct * 2)
+            cc.txt.g          = hpPct > 0.5 and 1 or (hpPct * 2)
+            cc.txt.hpStr      = "♥ " .. mfloor(hpPct * 100 + 0.5) .. "%"
+            cc.txt.colorDirty = true
+        end
+
+        -- Seed the text state with the current health before any event fires.
+        onHealth(hum.Health)
+
+        state.healthConn = hum.HealthChanged:Connect(onHealth)
+
+        -- Remove any stale entry (e.g. rapid respawn edge case) then add fresh.
+        espRemoveFromList(pl)
+        espRenderList[#espRenderList + 1] = { pl = pl, cc = cc }
+
+        -- Immediately remove from render list when the humanoid dies so the
+        -- render loop never sees a dead player.
+        state.humConn = hum.Died:Connect(function()
+            espRemoveFromList(pl)
+            espHidePlayer(pl)
+        end)
+    end
+
+    state.charAddedConn = pl.CharacterAdded:Connect(function(ch)
+        -- Spawn so WaitForChild doesn't block the event thread.
+        task.spawn(onCharacter, ch)
+    end)
+
+    state.charRemovingConn = pl.CharacterRemoving:Connect(function()
+        if state.humConn    then state.humConn:Disconnect();    state.humConn    = nil end
+        if state.healthConn then state.healthConn:Disconnect(); state.healthConn = nil end
+        espRemoveFromList(pl)
+        espHidePlayer(pl)
+        espCharCache[pl] = nil
+    end)
+
+    espPlayerConns[pl] = state
+
+    -- Bootstrap: if the player already has a living character (e.g. late-load).
+    if pl.Character then
+        task.spawn(onCharacter, pl.Character)
+    end
+end
+
+-- ── Player cache + event wiring ───────────────────────────────────────────────
 local playerCache = {}
 
 do
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= LocalPlayer then
             playerCache[#playerCache + 1] = p
+            setupEspPlayer(p)
         end
     end
 
     Players.PlayerAdded:Connect(function(p)
         playerCache[#playerCache + 1] = p
+        setupEspPlayer(p)
     end)
 
     Players.PlayerRemoving:Connect(function(p)
-        -- Swap-remove: O(1) instead of table.remove's O(n) element shift.
-        -- Moves the last element into the vacated slot then trims the tail.
-        -- Order is not preserved, but playerCache is never iterated in order.
+        -- Remove from aimbot player cache (swap-remove, O(1)).
         for i = 1, #playerCache do
             if playerCache[i] == p then
                 playerCache[i] = playerCache[#playerCache]
@@ -224,34 +364,27 @@ do
             end
         end
 
-        -- FIX: Immediately evict stale per-character cache entries so the
-        -- Character Model is no longer held alive by the table keys.
+        -- Evict aimbot per-character caches.
         local char = p.Character
         if char then
             visCache[char]        = nil
             targetPartCache[char] = nil
         end
 
-        -- Remove the player's ESP Drawing object (if one was created) so it
-        -- doesn't linger on screen after the player disconnects.
-        if espBoxPool[p] then
-            pcall(function() espBoxPool[p]:Remove() end)
-            espBoxPool[p] = nil
+        -- Disconnect all ESP event connections for this player.
+        local state = espPlayerConns[p]
+        if state then
+            if state.charAddedConn    then state.charAddedConn:Disconnect()    end
+            if state.charRemovingConn then state.charRemovingConn:Disconnect() end
+            if state.humConn          then state.humConn:Disconnect()          end
+            if state.healthConn       then state.healthConn:Disconnect()       end
+            espPlayerConns[p] = nil
         end
-        if espCharmPool[p] then
-            pcall(function() espCharmPool[p]:Remove() end)
-            espCharmPool[p] = nil
-        end
-        if espHighlightPool[p] then
-            pcall(function() espHighlightPool[p]:Destroy() end)
-            espHighlightPool[p] = nil
-        end
-        if espTextPool[p] then
-            pcall(function() espTextPool[p].name:Remove() end)
-            pcall(function() espTextPool[p].info:Remove() end)
-            espTextPool[p] = nil
-        end
+
+        -- Remove from ESP render list and destroy all drawing objects.
+        espRemoveFromList(p)
         espCharCache[p] = nil
+        espDestroyPools(p)
     end)
 end
 
