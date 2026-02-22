@@ -542,3 +542,4 @@ ScreenGui.Destroying:Connect(stopEsp)
 -- All sections (including startAimbot/stopAimbot in [12]) are now defined,
 -- so it is safe to call applySettingsToUI which fires widget callbacks.
 applySettingsToUI()
+
