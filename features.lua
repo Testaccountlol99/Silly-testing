@@ -210,49 +210,88 @@ startAimbot = function()
             overrideActive = false
         end
 
-        local safeDt = mclamp(dt, 0.001, 0.05)
+                local safeDt = mclamp(dt, 0.001, 0.05)
 
         -- ── Kalman-filter prediction ──────────────────────────────────────────
         local rawPos = rootPart.Position
         predSmoothedVel, predSmoothedAccel = updateKalman(rawPos, safeDt)
         trackingDistance = (rawPos - camPos).Magnitude
 
-        local velMag    = predSmoothedVel.Magnitude
-        local accelMag  = predSmoothedAccel.Magnitude
+        local isBlatant = (Settings.Mode ~= "Legit")
 
-        local targetWalkSpeed = mmax(targetHumanoid.WalkSpeed, 1)
-        local velScale   = mclamp(velMag / targetWalkSpeed, 0, 1)
-        local changeRate = accelMag / mmax(velMag, 1)
-        local stability  = mclamp(1 - changeRate * 0.12, 0.35, 1.0)
-
-        local adaptiveFactor = Settings.AdaptivePrediction
-            and (velScale * stability) or 1.0
-
-        -- Latency penalty: smoothly reduces prediction horizon at high ping.
-        local latencyPenalty = 1.0
-        if cachedPing > 0.1 then
-            if cachedPing < 0.15 then
-                latencyPenalty = 1.0 - (cachedPing - 0.1) * 3.0
-            elseif cachedPing < 0.2 then
-                latencyPenalty = 0.85 - (cachedPing - 0.15) * 4.0
-            else
-                latencyPenalty = mmax(0.65 - (cachedPing - 0.2) * 4.0, 0.45)
+        -- ── Gravity prior (blatant only) ──────────────────────────────────────
+        -- When the target is airborne, nudge the Kalman Y-acceleration toward
+        -- Workspace.Gravity so we don't have to wait for the filter to converge.
+        -- This makes falling / jumping prediction near-instant.
+        if isBlatant and Settings.Prediction then
+            local floorMat = targetHumanoid.FloorMaterial
+            if floorMat == Enum.Material.Air then
+                -- Blend Kalman accel toward gravity.  Alpha 0.35 means ~3 frames
+                -- to converge from zero — fast enough for a bhop apex.
+                local gravityAccel = -workspace.Gravity  -- negative Y in world space
+                K.accel[2] = K.accel[2] + (gravityAccel - K.accel[2]) * 0.35
+                -- Refresh the cached vector so prediction below uses the corrected value.
+                predSmoothedAccel = Vector3.new(K.accel[1], K.accel[2], K.accel[3])
             end
         end
 
-        local predTime = cachedPing * adaptiveFactor * latencyPenalty
-            * Settings.PredictionFactor
+        -- ── Prediction horizon ────────────────────────────────────────────────
+        local predTime
+        if isBlatant then
+            -- Blatant: full ping compensation, no adaptive reduction.
+            -- Latency penalty is softer — only kicks in above 200 ms.
+            local latPenalty = 1.0
+            if cachedPing > 0.2 then
+                latPenalty = mmax(0.8 - (cachedPing - 0.2) * 2.0, 0.5)
+            end
+            predTime = cachedPing * Settings.PredictionFactor * latPenalty
+        else
+            -- Legit: original adaptive logic (unchanged)
+            local velMag    = predSmoothedVel.Magnitude
+            local accelMag  = predSmoothedAccel.Magnitude
+            local targetWalkSpeed = mmax(targetHumanoid.WalkSpeed, 1)
+            local velScale   = mclamp(velMag / targetWalkSpeed, 0, 1)
+            local changeRate = accelMag / mmax(velMag, 1)
+            local stability  = mclamp(1 - changeRate * 0.12, 0.35, 1.0)
+            local adaptiveFactor = Settings.AdaptivePrediction
+                and (velScale * stability) or 1.0
 
-        -- Damp the acceleration term at large look-aheads to avoid overshoot.
-        local accelDamping = predTime > 0.15
-            and mclamp(1.0 - (predTime - 0.15) * 5.0, 0.25, 1.0) or 1.0
+            local latencyPenalty = 1.0
+            if cachedPing > 0.1 then
+                if cachedPing < 0.15 then
+                    latencyPenalty = 1.0 - (cachedPing - 0.1) * 3.0
+                elseif cachedPing < 0.2 then
+                    latencyPenalty = 0.85 - (cachedPing - 0.15) * 4.0
+                else
+                    latencyPenalty = mmax(0.65 - (cachedPing - 0.2) * 4.0, 0.45)
+                end
+            end
+            predTime = cachedPing * adaptiveFactor * latencyPenalty
+                * Settings.PredictionFactor
+        end
 
-        local aimPos = Settings.Prediction
-            and (targetPart.Position
-                + predSmoothedVel   * predTime
-                + predSmoothedAccel * (0.5 * predTime * predTime * accelDamping))
-            or  targetPart.Position
+        -- ── Compute aim position ──────────────────────────────────────────────
+        local aimPos
+        if Settings.Prediction then
+            if isBlatant then
+                -- Full CA extrapolation — no damping.
+                -- pos + vel*t + 0.5*accel*t²
+                aimPos = targetPart.Position
+                    + predSmoothedVel   * predTime
+                    + predSmoothedAccel * (0.5 * predTime * predTime)
+            else
+                -- Legit: keep the original damped extrapolation.
+                local accelDamping = predTime > 0.15
+                    and mclamp(1.0 - (predTime - 0.15) * 5.0, 0.25, 1.0) or 1.0
+                aimPos = targetPart.Position
+                    + predSmoothedVel   * predTime
+                    + predSmoothedAccel * (0.5 * predTime * predTime * accelDamping)
+            end
+        else
+            aimPos = targetPart.Position
+        end
 
+        -- ── Legit-mode aim error (unchanged) ─────────────────────────────────
         if Settings.Mode == "Legit" then
             local dist = (targetPart.Position - camPos).Magnitude
             aimPos = aimPos + generateAimError(predSmoothedVel, dist, dt)

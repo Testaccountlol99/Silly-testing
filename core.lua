@@ -191,10 +191,10 @@ local espRenderList  = {}   -- [i] = { pl=Player, cc={ ch, hum, root, head, txt 
 local espCharCache   = {}   -- [player] = cc  (same table as renderList entry)
 local espPlayerConns = {}   -- [player] = { charAddedConn, charRemovingConn, humConn, healthConn }
 
--- Forward-declared: body defined in features.lua after Drawing system is set up.
--- onCharacter calls this to pre-create text drawings at spawn time so the
--- render loop never needs to build or set them from scratch.
-local getEspText
+-- getEspText is defined in features.lua and assigned as a global there.
+-- Do NOT forward-declare it as a local here — a local nil would shadow the
+-- global and cause "attempt to call a nil value" in onCharacter (line 285).
+-- Resolution happens at call time from the global environment.
 
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 -- Hide all ESP drawings for one player immediately.
@@ -631,31 +631,54 @@ local function resetSpring()
     Spr.vel = ZERO3
 end
 
--- ── Kalman filter: constant-velocity model, one independent filter per axis ──
--- Replaces the old magic-alpha EMA.  The filter tracks position + velocity and
--- produces principled noise rejection.
---   State:  s = [pos, vel]   Transition (dt): F = [[1,dt],[0,1]]
---   Observation: H = [1,0]   Process noise: Q = diag(1e-3, 0.6)
---   Measurement noise: R = 0.08
+-- ── Constant-Acceleration Kalman ──────────────────────────────────────────────
+-- State per axis: [pos, vel, accel]
+-- Transition (dt):
+--   pos' = pos + vel*dt + 0.5*accel*dt²
+--   vel' = vel + accel*dt
+--   acc' = accel                            (constant-acceleration assumption)
 --
--- All four state arrays (pos, vel, covariance P, initialised flag) live in
--- one table so only a single chunk-level slot is needed.
--- K.P[i] = flat {P11,P12,P21,P22} for axis i.
+-- Observation: we observe position only → H = [1, 0, 0]
+--
+-- Process noise Q (tuned for Roblox character motion):
+--   Q_POS   = 1e-3   (position jitter — very small)
+--   Q_VEL   = 0.4    (velocity can change moderately between frames)
+--   Q_ACCEL = 8.0    (acceleration can change abruptly: jump start/stop)
+--
+-- Measurement noise R = 0.06  (Roblox replication is fairly precise)
+
 local K = {
-    pos  = {0, 0, 0},
-    vel  = {0, 0, 0},
-    P    = {{1,0,0,1}, {1,0,0,1}, {1,0,0,1}},
-    init = false,
+    pos   = {0, 0, 0},
+    vel   = {0, 0, 0},
+    accel = {0, 0, 0},
+    -- P is 3x3 per axis, stored flat: {P11,P12,P13, P21,P22,P23, P31,P32,P33}
+    P     = {
+        {1,0,0, 0,1,0, 0,0,1},
+        {1,0,0, 0,1,0, 0,0,1},
+        {1,0,0, 0,1,0, 0,0,1},
+    },
+    init  = false,
 }
 
-local predSmoothedVel   = ZERO3  -- Kalman-estimated velocity  (used by render loop)
-local predSmoothedAccel = ZERO3  -- finite-difference accel from Kalman vel
+-- Process noise diagonals (only diagonal Q for efficiency)
+local Q_POS   = 1e-3
+local Q_VEL   = 0.4
+local Q_ACCEL = 8.0
+local R_POS   = 0.06
+
+local predSmoothedVel   = ZERO3
+local predSmoothedAccel = ZERO3
 
 local function resetPrediction()
-    K.pos  = {0, 0, 0}
-    K.vel  = {0, 0, 0}
-    K.P    = {{1,0,0,1}, {1,0,0,1}, {1,0,0,1}}
-    K.init = false
+    K.pos   = {0, 0, 0}
+    K.vel   = {0, 0, 0}
+    K.accel = {0, 0, 0}
+    K.P     = {
+        {1,0,0, 0,1,0, 0,0,1},
+        {1,0,0, 0,1,0, 0,0,1},
+        {1,0,0, 0,1,0, 0,0,1},
+    }
+    K.init  = false
     predSmoothedVel   = ZERO3
     predSmoothedAccel = ZERO3
 end
@@ -666,52 +689,84 @@ local function updateKalman(meas, dt)
     local mx = {meas.X, meas.Y, meas.Z}
 
     if not K.init then
-        K.pos  = {mx[1], mx[2], mx[3]}
-        K.vel  = {0, 0, 0}
-        K.init = true
+        K.pos   = {mx[1], mx[2], mx[3]}
+        K.vel   = {0, 0, 0}
+        K.accel = {0, 0, 0}
+        K.init  = true
         return ZERO3, ZERO3
     end
 
-    local prevVel = {K.vel[1], K.vel[2], K.vel[3]}
+    local dt2 = dt * dt
+    local halfDt2 = 0.5 * dt2
 
     for i = 1, 3 do
-        local p   = K.pos[i]
-        local v   = K.vel[i]
-        local P11 = K.P[i][1]; local P12 = K.P[i][2]
-        local P21 = K.P[i][3]; local P22 = K.P[i][4]
+        local p = K.pos[i]
+        local v = K.vel[i]
+        local a = K.accel[i]
 
-        -- ── Predict ──────────────────────────────────────────────────────────
-        local pPred = p + v * dt
-        local vPred = v
-        -- P_pred = F*P*F' + Q  (Q_POS=1e-3, Q_VEL=0.6 inlined)
-        local PP11 = P11 + dt*(P12 + P21) + dt*dt*P22 + 1e-3
-        local PP12 = P12 + dt*P22
-        local PP21 = P21 + dt*P22
-        local PP22 = P22 + 0.6
+        -- Flat P indices: {1=P11, 2=P12, 3=P13, 4=P21, 5=P22, 6=P23, 7=P31, 8=P32, 9=P33}
+        local Pi = K.P[i]
+        local P11,P12,P13 = Pi[1],Pi[2],Pi[3]
+        local P21,P22,P23 = Pi[4],Pi[5],Pi[6]
+        local P31,P32,P33 = Pi[7],Pi[8],Pi[9]
 
-        -- ── Update (observe position) ─────────────────────────────────────
-        local S  = PP11 + 0.08  -- R_POS inlined
-        local K1 = PP11 / S
-        local K2 = PP21 / S
+        -- ── Predict state ────────────────────────────────────────────────────
+        local pPred = p + v * dt + a * halfDt2
+        local vPred = v + a * dt
+        local aPred = a  -- constant-acceleration assumption
+
+        -- ── Predict covariance: P_pred = F * P * F^T + Q ─────────────────────
+        -- F = [[1, dt, 0.5*dt²],
+        --      [0,  1,      dt ],
+        --      [0,  0,       1 ]]
+        --
+        -- Rather than full 3x3 matrix multiply, we expand symbolically.
+        -- FP = F * P  (row by column)
+        local FP11 = P11 + dt*P21 + halfDt2*P31
+        local FP12 = P12 + dt*P22 + halfDt2*P32
+        local FP13 = P13 + dt*P23 + halfDt2*P33
+        local FP21 = P21 + dt*P31
+        local FP22 = P22 + dt*P32
+        local FP23 = P23 + dt*P33
+        local FP31 = P31
+        local FP32 = P32
+        local FP33 = P33
+
+        -- PP = FP * F^T  (multiply each row of FP by columns of F^T)
+        -- F^T columns: [1,0,0], [dt,1,0], [0.5dt²,dt,1]
+        local PP11 = FP11 + FP12*dt + FP13*halfDt2 + Q_POS
+        local PP12 = FP12 + FP13*dt
+        local PP13 = FP13
+        local PP21 = FP21 + FP22*dt + FP23*halfDt2
+        local PP22 = FP22 + FP23*dt + Q_VEL
+        local PP23 = FP23
+        local PP31 = FP31 + FP32*dt + FP33*halfDt2
+        local PP32 = FP32 + FP33*dt
+        local PP33 = FP33 + Q_ACCEL
+
+        -- ── Update (observe position: H = [1, 0, 0]) ─────────────────────────
+        local S  = PP11 + R_POS
+        local invS = 1.0 / S
+        local K1 = PP11 * invS
+        local K2 = PP21 * invS
+        local K3 = PP31 * invS
+
         local innov = mx[i] - pPred
 
-        K.pos[i] = pPred + K1 * innov
-        K.vel[i] = vPred + K2 * innov
+        K.pos[i]   = pPred + K1 * innov
+        K.vel[i]   = vPred + K2 * innov
+        K.accel[i] = aPred + K3 * innov
 
-        -- Covariance update  (Joseph form: (I-KH)*P for numerical stability)
-        K.P[i][1] = (1 - K1) * PP11
-        K.P[i][2] = (1 - K1) * PP12
-        K.P[i][3] = PP21 - K2 * PP11
-        K.P[i][4] = PP22 - K2 * PP21
+        -- ── Covariance update: P = (I - K*H) * PP ───────────────────────────
+        -- K*H = [[K1,0,0],[K2,0,0],[K3,0,0]]
+        Pi[1] = PP11 - K1*PP11;  Pi[2] = PP12 - K1*PP12;  Pi[3] = PP13 - K1*PP13
+        Pi[4] = PP21 - K2*PP11;  Pi[5] = PP22 - K2*PP12;  Pi[6] = PP23 - K2*PP13
+        Pi[7] = PP31 - K3*PP11;  Pi[8] = PP32 - K3*PP12;  Pi[9] = PP33 - K3*PP13
     end
 
-    local estVel = Vector3.new(K.vel[1], K.vel[2], K.vel[3])
-    local estAccel = Vector3.new(
-        (K.vel[1] - prevVel[1]) / dt,
-        (K.vel[2] - prevVel[2]) / dt,
-        (K.vel[3] - prevVel[3]) / dt
-    )
-    return estVel, estAccel
+    predSmoothedVel   = Vector3.new(K.vel[1],   K.vel[2],   K.vel[3])
+    predSmoothedAccel = Vector3.new(K.accel[1], K.accel[2], K.accel[3])
+    return predSmoothedVel, predSmoothedAccel
 end
 
 -- ── Seeded fBm value noise ────────────────────────────────────────────────────
@@ -900,4 +955,3 @@ local pingThread = task.spawn(function()
         cachedPing = LocalPlayer:GetNetworkPing()
     end
 end)
-
