@@ -214,15 +214,17 @@ local function setupEspPlayer(pl)
         if state.humConn    then state.humConn:Disconnect();    state.humConn    = nil end
         if state.healthConn then state.healthConn:Disconnect(); state.healthConn = nil end
 
-        local hum = ch:WaitForChild("Humanoid", 5)
-        if not hum then return end
-        if pl.Character ~= ch then return end
+        local hum  = ch:WaitForChild("Humanoid",         5)
+        local root = ch:WaitForChild("HumanoidRootPart", 5)
+        local head = ch:WaitForChild("Head",             5)
+        if not hum or not root or not head then return end
+        if pl.Character ~= ch then return end   -- re-validate after all waits
 
         local cc = {
             ch   = ch,
             hum  = hum,
-            root = ch:FindFirstChild("HumanoidRootPart"),
-            head = ch:FindFirstChild("Head"),
+            root = root,
+            head = head,
             txt = {
                 hpStr      = "",
                 r          = 0,

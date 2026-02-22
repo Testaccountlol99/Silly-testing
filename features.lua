@@ -374,23 +374,33 @@ startEsp = function()
 
             if espType == "Box" then
                 if rootVisible then
-                    local bbCF, bbSize = cc.ch:GetBoundingBox()
-                    local hx = bbSize.X * 0.5
-                    local hy = bbSize.Y * 0.5
-                    local hz = bbSize.Z * 0.5
+                    -- Compute screen-space AABB using only the character's direct
+                    -- BasePart children.  Accessories (Accessory > Handle) and
+                    -- held tools (Tool > Handle) are parented inside their own
+                    -- sub-Model/Accessory container, so their Handle parts do NOT
+                    -- appear as direct children here — giving a body-only box.
                     local minSX, minSY =  mhuge,  mhuge
                     local maxSX, maxSY = -mhuge, -mhuge
                     local frontCount   = 0
-                    for _, s in ipairs(CORNER_SIGNS) do
-                        local wp = bbCF:PointToWorldSpace(
-                            Vector3.new(s[1]*hx, s[2]*hy, s[3]*hz))
-                        local sp = Camera:WorldToViewportPoint(wp)
-                        if sp.Z > 0 then
-                            frontCount = frontCount + 1
-                            if sp.X < minSX then minSX = sp.X end
-                            if sp.X > maxSX then maxSX = sp.X end
-                            if sp.Y < minSY then minSY = sp.Y end
-                            if sp.Y > maxSY then maxSY = sp.Y end
+                    for _, part in ipairs(cc.ch:GetChildren()) do
+                        if part:IsA("BasePart") then
+                            local cf   = part.CFrame
+                            local size = part.Size
+                            local hx   = size.X * 0.5
+                            local hy   = size.Y * 0.5
+                            local hz   = size.Z * 0.5
+                            for _, s in ipairs(CORNER_SIGNS) do
+                                local wp = cf:PointToWorldSpace(
+                                    Vector3.new(s[1]*hx, s[2]*hy, s[3]*hz))
+                                local sp = Camera:WorldToViewportPoint(wp)
+                                if sp.Z > 0 then
+                                    frontCount = frontCount + 1
+                                    if sp.X < minSX then minSX = sp.X end
+                                    if sp.X > maxSX then maxSX = sp.X end
+                                    if sp.Y < minSY then minSY = sp.Y end
+                                    if sp.Y > maxSY then maxSY = sp.Y end
+                                end
+                            end
                         end
                     end
                     if frontCount > 0 and maxSY > minSY then
