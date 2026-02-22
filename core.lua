@@ -41,10 +41,10 @@ local LocalPlayer = Players.LocalPlayer
 local Defaults = {
     Enabled          = false,
     EspEnabled       = false,
-    PlayerEspEnabled = true,   -- player-specific esp toggle (sub-toggle of EspEnabled)
-    EspTextEnabled   = false,  -- per-player name/hp/distance text overlay
+    PlayerEspEnabled = true,
+    EspTextEnabled   = false,
     EspTeamCheck     = true,
-    EspTeamColors    = false,  -- tint ESP drawings with each player's team color
+    EspTeamColors    = false,
     EspType          = "Box",
     WallCheck        = true,
     Mode             = "Legit",
@@ -59,8 +59,8 @@ local Defaults = {
     AdaptivePrediction = true,
     -- Health Check
     HealthCheckEnabled = false,
-    HealthMinHP        = 0,    -- minimum HP% to consider (0-100)
-    HealthMaxHP        = 100,  -- maximum HP% to consider (0-100)
+    HealthMinHP        = 0,
+    HealthMaxHP        = 100,
     -- Legit
     MinReactionTime  = 0.15,
     MaxReactionTime  = 0.35,
@@ -68,22 +68,19 @@ local Defaults = {
     TrackingError    = 0.8,
     ShakeIntensity   = 0.3,
     -- Target Override
-    OverrideThreshold = 12,   -- mouse delta magnitude (px/frame) to trigger override
-    OverrideCooldown  = 0.25, -- seconds the aimbot stays suppressed after a flick
+    OverrideThreshold = 12,
+    OverrideCooldown  = 0.25,
+    -- Prediction tuning
+    MinPredictionTime = 0.02,  -- floor prediction horizon (seconds) even at 0 ping
     -- Whitelist
-    -- Keyed by team Name (string) -> true.  O(1) lookup in isWhitelisted().
     WhitelistedTeams  = {},
 }
 
 local Settings = {}
 for k, v in pairs(Defaults) do Settings[k] = v end
 
--- HardDefaults: immutable copy of the compiled defaults.
--- uiResets close over Defaults.X at call time, so they always reset to these
--- hardcoded values even after a save file has been loaded.
 local HardDefaults = {}
 for k, v in pairs(Defaults) do HardDefaults[k] = v end
--- WhitelistedTeams is a table; keep the original reference separate.
 HardDefaults.WhitelistedTeams = {}
 
 local uiResets = {}
@@ -93,8 +90,6 @@ local uiResets = {}
 -- ============================================================
 local SAVE_FILE = "AimbotSettings.json"
 
--- Keys whose values are plain primitives (bool / number / string).
--- WhitelistedTeams is handled separately as an array <-> set conversion.
 local SAVE_KEYS = {
     "Enabled", "EspEnabled", "PlayerEspEnabled", "EspTextEnabled", "EspTeamCheck", "EspTeamColors", "EspType", "WallCheck", "Mode", "TeamCheck", "Prediction", "TargetPart",
     "FOV", "MaxDistance", "PredictionFactor", "Smoothness", "AdaptivePrediction",
@@ -102,6 +97,7 @@ local SAVE_KEYS = {
     "MinReactionTime", "MaxReactionTime", "MeanReactionTime",
     "TrackingError", "ShakeIntensity",
     "OverrideThreshold", "OverrideCooldown",
+    "MinPredictionTime",
 }
 
 local function serializeSettings()
@@ -109,7 +105,6 @@ local function serializeSettings()
     for _, k in ipairs(SAVE_KEYS) do
         t[k] = Settings[k]
     end
-    -- WhitelistedTeams: set -> sorted array for stable JSON.
     local teams = {}
     for name in pairs(Settings.WhitelistedTeams) do
         teams[#teams + 1] = name
@@ -119,8 +114,6 @@ local function serializeSettings()
     return t
 end
 
--- saveSettings: writes current Settings to the JSON file.
--- Returns true on success, false + reason string on failure.
 local function saveSettings()
     local ok, result = pcall(function()
         local encoded = HttpService:JSONEncode(serializeSettings())
@@ -129,10 +122,6 @@ local function saveSettings()
     return ok, ok or result
 end
 
--- loadSettings: reads the JSON file (if it exists) and overwrites
--- the relevant keys in Settings.  Safe against malformed files.
--- Called BEFORE the UI is built so Kalman / reaction state starts correctly.
--- The UI visuals are synced separately via applySettingsToUI() after build.
 local function loadSettings()
     if not isfile(SAVE_FILE) then return end
     local ok, data = pcall(function()
@@ -147,7 +136,6 @@ local function loadSettings()
         end
     end
 
-    -- WhitelistedTeams: array -> set
     if type(data.WhitelistedTeams) == "table" then
         table.clear(Settings.WhitelistedTeams)
         for _, name in ipairs(data.WhitelistedTeams) do
@@ -158,46 +146,25 @@ local function loadSettings()
     end
 end
 
--- Load saved values into Settings immediately so runtime behaviour
--- reflects the file from the first frame, before the UI is built.
 loadSettings()
 
 -- ============================================================
 -- [3] PLAYER CACHE
 -- ============================================================
 
--- FIX: Declare the two per-character caches here, before playerCache is
--- populated, so the PlayerRemoving hook below can reference both tables
--- to evict entries the moment a player leaves.  In the original code these
--- were declared later (inside [4]) which meant PlayerRemoving could never
--- clean them, causing the leaving player's Character Model to be kept alive
--- as a table key long after the player had gone (memory leak).
-local visCache        = {}   -- [char] = {visible:bool, lastCheck:number}
-local targetPartCache = {}   -- [char] = "Head"|"HumanoidRootPart"
-local espBoxPool       = {}   -- [player] = Drawing "Square" object
-local espCharmPool     = {}   -- [player] = Drawing "Circle" object (Circle/Mark mode)
-local espHighlightPool = {}   -- [player] = Highlight instance (Charm mode)
-local espTextPool      = {}   -- [player] = { name=Drawing.Text, info=Drawing.Text }
+local visCache        = {}
+local targetPartCache = {}
+local espBoxPool       = {}
+local espCharmPool     = {}
+local espHighlightPool = {}
+local espTextPool      = {}
 
--- ── ESP constants ─────────────────────────────────────────────────────────────
-local ESP_COLOR_DEFAULT = Color3.fromRGB(255, 69, 0)  -- avoids alloc per frame
+local ESP_COLOR_DEFAULT = Color3.fromRGB(255, 69, 0)
 
--- ── ESP render list (event-driven) ───────────────────────────────────────────
--- Only players who are currently alive with a loaded character live here.
--- CharacterAdded adds entries; Humanoid.Died and CharacterRemoving remove them.
--- The RenderStepped loop iterates ONLY this list — no health checks, no
--- FindFirstChild calls, no hide-pass for dead/gone players needed.
-local espRenderList  = {}   -- [i] = { pl=Player, cc={ ch, hum, root, head, txt } }
-local espCharCache   = {}   -- [player] = cc  (same table as renderList entry)
-local espPlayerConns = {}   -- [player] = { charAddedConn, charRemovingConn, humConn, healthConn }
+local espRenderList  = {}
+local espCharCache   = {}
+local espPlayerConns = {}
 
--- getEspText is defined in features.lua and assigned as a global there.
--- Do NOT forward-declare it as a local here — a local nil would shadow the
--- global and cause "attempt to call a nil value" in onCharacter (line 285).
--- Resolution happens at call time from the global environment.
-
--- ── Helpers ───────────────────────────────────────────────────────────────────
--- Hide all ESP drawings for one player immediately.
 local function espHidePlayer(pl)
     if espBoxPool[pl]       then espBoxPool[pl].Visible       = false end
     if espCharmPool[pl]     then espCharmPool[pl].Visible     = false end
@@ -208,7 +175,6 @@ local function espHidePlayer(pl)
     end
 end
 
--- Swap-remove player from espRenderList in O(1).
 local function espRemoveFromList(pl)
     for i = 1, #espRenderList do
         if espRenderList[i].pl == pl then
@@ -219,7 +185,6 @@ local function espRemoveFromList(pl)
     end
 end
 
--- Fully destroy all pool objects for a player and free memory.
 local function espDestroyPools(pl)
     if espBoxPool[pl] then
         pcall(function() espBoxPool[pl]:Remove() end)
@@ -240,24 +205,17 @@ local function espDestroyPools(pl)
     end
 end
 
--- ── Per-player event wiring ───────────────────────────────────────────────────
--- Sets up CharacterAdded / CharacterRemoving / Humanoid.Died for one player.
--- Called for every existing player at startup and for each PlayerAdded.
 local function setupEspPlayer(pl)
     if pl == LocalPlayer then return end
 
-    local state = {}  -- holds the three live connections for this player
+    local state = {}
 
     local function onCharacter(ch)
-        -- Disconnect previous per-character connections if the player respawned.
         if state.humConn    then state.humConn:Disconnect();    state.humConn    = nil end
         if state.healthConn then state.healthConn:Disconnect(); state.healthConn = nil end
 
-        -- Humanoid may not be replicated yet — wait briefly rather than poll.
         local hum = ch:WaitForChild("Humanoid", 5)
-        if not hum then return end  -- malformed character; skip
-
-        -- Verify the character hasn't already been removed while we waited.
+        if not hum then return end
         if pl.Character ~= ch then return end
 
         local cc = {
@@ -265,32 +223,19 @@ local function setupEspPlayer(pl)
             hum  = hum,
             root = ch:FindFirstChild("HumanoidRootPart"),
             head = ch:FindFirstChild("Head"),
-            -- ── Text state ──────────────────────────────────────────────────
-            -- Pre-computed per-player text data so the render loop does zero
-            -- health math, zero string building, and zero Color3 allocs except
-            -- when health actually changes or the integer distance changes.
             txt = {
-                hpStr      = "",     -- "♥ 100%" — rebuilt by HealthChanged
-                r          = 0,      -- pre-computed colour components
+                hpStr      = "",
+                r          = 0,
                 g          = 1,
-                lastDist   = -1,     -- last integer distance; -1 forces first build
-                colorDirty = true,   -- true whenever health changed since last rebuild
+                lastDist   = -1,
+                colorDirty = true,
             },
         }
         espCharCache[pl] = cc
 
-        -- Pre-create text drawings and set the player's name immediately.
-        -- Name is static for the session — setting it once here means the
-        -- render loop never needs to touch t.name.Text at all.
         local t = getEspText(pl)
         t.name.Text = pl.DisplayName
 
-        -- ── HealthChanged ────────────────────────────────────────────────────
-        -- Fires whenever Health changes. We pre-compute the health string and
-        -- colour components here so the render loop is just a table read.
-        -- newC3 is called only inside the render loop when it also needs to
-        -- rebuild the info string (dist changed OR colorDirty), not here —
-        -- that way one alloc covers both changes in the same frame.
         local function onHealth(newHealth)
             local maxHp = mmax(hum.MaxHealth, 1)
             local hpPct = mclamp(newHealth / maxHp, 0, 1)
@@ -300,17 +245,13 @@ local function setupEspPlayer(pl)
             cc.txt.colorDirty = true
         end
 
-        -- Seed the text state with the current health before any event fires.
         onHealth(hum.Health)
 
         state.healthConn = hum.HealthChanged:Connect(onHealth)
 
-        -- Remove any stale entry (e.g. rapid respawn edge case) then add fresh.
         espRemoveFromList(pl)
         espRenderList[#espRenderList + 1] = { pl = pl, cc = cc }
 
-        -- Immediately remove from render list when the humanoid dies so the
-        -- render loop never sees a dead player.
         state.humConn = hum.Died:Connect(function()
             espRemoveFromList(pl)
             espHidePlayer(pl)
@@ -318,7 +259,6 @@ local function setupEspPlayer(pl)
     end
 
     state.charAddedConn = pl.CharacterAdded:Connect(function(ch)
-        -- Spawn so WaitForChild doesn't block the event thread.
         task.spawn(onCharacter, ch)
     end)
 
@@ -332,13 +272,11 @@ local function setupEspPlayer(pl)
 
     espPlayerConns[pl] = state
 
-    -- Bootstrap: if the player already has a living character (e.g. late-load).
     if pl.Character then
         task.spawn(onCharacter, pl.Character)
     end
 end
 
--- ── Player cache + event wiring ───────────────────────────────────────────────
 local playerCache = {}
 
 do
@@ -355,7 +293,6 @@ do
     end)
 
     Players.PlayerRemoving:Connect(function(p)
-        -- Remove from aimbot player cache (swap-remove, O(1)).
         for i = 1, #playerCache do
             if playerCache[i] == p then
                 playerCache[i] = playerCache[#playerCache]
@@ -364,14 +301,12 @@ do
             end
         end
 
-        -- Evict aimbot per-character caches.
         local char = p.Character
         if char then
             visCache[char]        = nil
             targetPartCache[char] = nil
         end
 
-        -- Disconnect all ESP event connections for this player.
         local state = espPlayerConns[p]
         if state then
             if state.charAddedConn    then state.charAddedConn:Disconnect()    end
@@ -381,7 +316,6 @@ do
             espPlayerConns[p] = nil
         end
 
-        -- Remove from ESP render list and destroy all drawing objects.
         espRemoveFromList(p)
         espCharCache[p] = nil
         espDestroyPools(p)
@@ -392,7 +326,6 @@ end
 -- [4] TARGET SYSTEM
 -- ============================================================
 
--- Screen centre (cached, only recomputed on resize)
 local cachedScreenCenter = Vector2.new(0, 0)
 local lastViewportSize   = Vector2.new(0, 0)
 
@@ -405,10 +338,6 @@ local function getScreenCenter()
     return cachedScreenCenter
 end
 
--- ── RaycastParams ─────────────────────────────────────────────────────────────
--- Two SEPARATE param objects: one for visibility checks, one for pre-shot.
--- Sharing a single object caused FilterDescendantsInstances to be clobbered
--- between the two call sites on the same frame.
 local visRayParams  = RaycastParams.new()
 visRayParams.FilterType = Enum.RaycastFilterType.Blacklist
 
@@ -422,7 +351,7 @@ local function refreshRayFilter()
     shotRayParams.FilterDescendantsInstances = list
 end
 
-refreshRayFilter()  -- initialise immediately
+refreshRayFilter()
 
 LocalPlayer.CharacterAdded:Connect(refreshRayFilter)
 LocalPlayer.CharacterRemoving:Connect(function()
@@ -430,17 +359,10 @@ LocalPlayer.CharacterRemoving:Connect(function()
     shotRayParams.FilterDescendantsInstances = {}
 end)
 
--- ── Visibility cache ───────────────────────────────────────────────────────────
--- Entries are reused (mutated in-place) to avoid per-check table allocation.
--- Layout: visCache[char] = { [1]=result:bool, [2]=lastCheck:number }
--- (Table declared in [3] so PlayerRemoving can evict entries on disconnect.)
-
--- FIX: Accept pre-cached `now` from the caller so isVisible does not need
--- its own tick() call on every invocation inside the hot target-scan loop.
 local function isVisible(targetPart, targetChar, now)
     local cached = visCache[targetChar]
 
-    if cached and (now - cached[2]) < 0.1 then  -- 0.1 s cache window
+    if cached and (now - cached[2]) < 0.1 then
         return cached[1]
     end
 
@@ -449,7 +371,6 @@ local function isVisible(targetPart, targetChar, now)
     local hit       = Workspace:Raycast(origin, direction, visRayParams)
     local visible   = not hit or hit.Instance:IsDescendantOf(targetChar)
 
-    -- Reuse existing table if present, else create once
     if cached then
         cached[1] = visible
         cached[2] = now
@@ -460,18 +381,12 @@ local function isVisible(targetPart, targetChar, now)
     return visible
 end
 
--- Periodic full flush: table.clear() in-place, no allocation.
--- Thread ref stored so it can be cancelled on ScreenGui.Destroying.
 local visCacheFlushThread = task.spawn(function()
     while true do
         task.wait(5)
         table.clear(visCache)
     end
 end)
-
--- ── Target-part resolution ────────────────────────────────────────────────────
--- "Random" assigns a part per character on first look and keeps it stable.
--- (Table declared in [3] so PlayerRemoving can evict entries on disconnect.)
 
 local function clearTargetPartCache()
     table.clear(targetPartCache)
@@ -491,11 +406,9 @@ local function getTargetPart(character)
     end
 end
 
--- isWhitelisted returns true if this player should be SKIPPED (never targeted).
 local function isWhitelisted(player)
     local playerTeam = player.Team
 
-    -- Rule 1: classic same-team protection
     if Settings.TeamCheck then
         local myTeam = LocalPlayer.Team
         if myTeam ~= nil and playerTeam == myTeam then
@@ -503,7 +416,6 @@ local function isWhitelisted(player)
         end
     end
 
-    -- Rule 2: named-team whitelist (multi-select)
     if playerTeam and Settings.WhitelistedTeams[playerTeam.Name] then
         return true
     end
@@ -511,15 +423,6 @@ local function isWhitelisted(player)
     return false
 end
 
--- FIX: Accept pre-cached `now` so the single tick() call at the top of the
--- render loop is shared across getClosestTarget -> isVisible, avoiding
--- redundant OS calls in what is already a per-frame hot path.
---
--- FIX (performance): Replace Vector2.new() + .Magnitude for the screen-space
--- distance cull with a raw squared-distance check (dsx^2 + dsy^2 < fovSq).
--- This eliminates one Vector2 allocation and one sqrt() per candidate per
--- frame.  The actual pixel distance (for scoring) is only computed once, on
--- the candidate that already passed the cheaper squared cull.
 local function getClosestTarget(now)
     local myChar = LocalPlayer.Character
     if not myChar then return nil, nil, nil, nil end
@@ -532,7 +435,6 @@ local function getClosestTarget(now)
     local scY          = screenCenter.Y
     local healthMode   = Settings.HealthCheckEnabled
 
-    -- Pre-compute squared thresholds once per call
     local maxDist   = Settings.MaxDistance
     local maxDistSq = maxDist * maxDist
     local fov       = Settings.FOV
@@ -550,7 +452,6 @@ local function getClosestTarget(now)
         local humanoid = char:FindFirstChildOfClass("Humanoid")
         if not humanoid or humanoid.Health <= 0 then continue end
 
-        -- Health range filter
         if healthMode then
             local maxHp = humanoid.MaxHealth
             local hpPct = maxHp > 0 and (humanoid.Health / maxHp * 100) or 0
@@ -561,25 +462,19 @@ local function getClosestTarget(now)
         local rootPart   = char:FindFirstChild("HumanoidRootPart")
         if not targetPart or not rootPart then continue end
 
-        -- World-distance cull: squared comparison avoids sqrt (cheap guard)
         local dp = targetPart.Position - myPos
         if dp.X*dp.X + dp.Y*dp.Y + dp.Z*dp.Z > maxDistSq then continue end
 
         local screenPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
         if not onScreen then continue end
 
-        -- Screen-space cull: squared comparison avoids Vector2 allocation + sqrt
         local dsx = screenPos.X - scX
         local dsy = screenPos.Y - scY
         local screenDistSq = dsx*dsx + dsy*dsy
         if screenDistSq >= fovSq then continue end
 
-        -- Scoring (only sqrt when this candidate has passed all cheaper filters)
         local score = healthMode and humanoid.Health or msqrt(screenDistSq)
 
-        -- HYSTERESIS: the current target gets a virtual score discount so a
-        -- challenger must be measurably closer before we switch, eliminating
-        -- frame-to-frame flicker between near-equidistant candidates.
         local effectiveScore = (player == currentTarget and not healthMode)
             and (score - 15) or score
 
@@ -605,23 +500,14 @@ local isReacting      = false
 local reactionEndTime = 0
 local alertnessLevel  = 0.5
 
--- ── Player override state ─────────────────────────────────────────────────────
 local overrideActive = false
 local overrideUntil  = 0
 
--- Spring-damper state: all fields in one table so only one chunk-level slot
--- is used instead of five.  Field names are abbreviated for inner-loop speed.
---   pos   = current look-at point the camera is being dragged toward
---   vel   = spring velocity in world-space (metres/s)
---   k     = cached stiffness  (recomputed when Smoothness changes)
---   d     = cached damping
---   lastS = the Smoothness value k/d were computed for (change detector)
 local Spr = {pos=nil, vel=ZERO3, k=0, d=0, lastS=-1}
 
 local function refreshSpringConstants()
     local s = Settings.Smoothness
     Spr.k   = 18 + (s ^ 1.6) * 560
-    -- Damping ratio 0.70 -> lightly underdamped
     Spr.d   = 0.70 * 2 * msqrt(Spr.k)
     Spr.lastS = s
 end
@@ -631,153 +517,283 @@ local function resetSpring()
     Spr.vel = ZERO3
 end
 
--- ── Constant-Acceleration Kalman ──────────────────────────────────────────────
--- State per axis: [pos, vel, accel]
--- Transition (dt):
---   pos' = pos + vel*dt + 0.5*accel*dt²
---   vel' = vel + accel*dt
---   acc' = accel                            (constant-acceleration assumption)
+-- ============================================================
+-- [5.1] JERK-MODEL KALMAN FILTER  (4-state per axis)
+-- ============================================================
+-- State vector per axis: [position, velocity, acceleration, jerk]
+-- Transition matrix F (dt):
+--   | 1   dt  dt²/2  dt³/6 |
+--   | 0   1   dt     dt²/2 |
+--   | 0   0   1      dt    |
+--   | 0   0   0      1     |
 --
--- Observation: we observe position only → H = [1, 0, 0]
+-- Observation: H = [1, 0, 0, 0]  (we observe position only)
 --
--- Process noise Q (tuned for Roblox character motion):
---   Q_POS   = 1e-3   (position jitter — very small)
---   Q_VEL   = 0.4    (velocity can change moderately between frames)
---   Q_ACCEL = 8.0    (acceleration can change abruptly: jump start/stop)
+-- This 4-state model natively tracks acceleration and jerk, meaning
+-- strafes, jumps, bhops, and direction changes are modelled in-state
+-- rather than treated as noise.  The prediction step uses all four
+-- states for a proper Taylor expansion, which gives far better
+-- look-ahead during parabolic arcs (jumps/falls) and snap direction
+-- changes (strafes/bhops).
+
+-- Process noise covariance Q diagonal (tuned for Roblox character dynamics):
+--   Q_POS   = 1e-4   (position is well-observed, low process noise)
+--   Q_VEL   = 0.08   (velocity changes moderately)
+--   Q_ACCEL = 2.5    (acceleration changes frequently — strafe/jump)
+--   Q_JERK  = 25.0   (jerk is very noisy — snap direction changes)
+-- Measurement noise R = 0.04  (Roblox positions are fairly clean)
 --
--- Measurement noise R = 0.06  (Roblox replication is fairly precise)
+-- Higher Q_ACCEL and Q_JERK make the filter MORE responsive to manoeuvres
+-- at the cost of slightly noisier steady-state — exactly the trade-off we want.
+
+local Q_POS   = 1e-4
+local Q_VEL   = 0.08
+local Q_ACCEL = 2.5
+local Q_JERK  = 25.0
+local R_MEAS  = 0.04
 
 local K = {
-    pos   = {0, 0, 0},
-    vel   = {0, 0, 0},
-    accel = {0, 0, 0},
-    -- P is 3x3 per axis, stored flat: {P11,P12,P13, P21,P22,P23, P31,P32,P33}
-    P     = {
-        {1,0,0, 0,1,0, 0,0,1},
-        {1,0,0, 0,1,0, 0,0,1},
-        {1,0,0, 0,1,0, 0,0,1},
+    -- Per-axis state: [pos, vel, accel, jerk]
+    s = {
+        {0, 0, 0, 0},  -- X
+        {0, 0, 0, 0},  -- Y
+        {0, 0, 0, 0},  -- Z
     },
-    init  = false,
+    -- Per-axis 4x4 covariance (flat 16-element array, row-major)
+    P = {nil, nil, nil},
+    init = false,
 }
 
--- Process noise diagonals (only diagonal Q for efficiency)
-local Q_POS   = 1e-3
-local Q_VEL   = 0.4
-local Q_ACCEL = 8.0
-local R_POS   = 0.06
-
-local predSmoothedVel   = ZERO3
-local predSmoothedAccel = ZERO3
-
-local function resetPrediction()
-    K.pos   = {0, 0, 0}
-    K.vel   = {0, 0, 0}
-    K.accel = {0, 0, 0}
-    K.P     = {
-        {1,0,0, 0,1,0, 0,0,1},
-        {1,0,0, 0,1,0, 0,0,1},
-        {1,0,0, 0,1,0, 0,0,1},
+-- Create a fresh 4x4 identity-ish covariance matrix
+local function newCovMatrix()
+    return {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
     }
-    K.init  = false
-    predSmoothedVel   = ZERO3
-    predSmoothedAccel = ZERO3
 end
 
--- Returns estimated velocity and acceleration vectors.
--- `meas` is the observed Vector3 position of the target part this frame.
+K.P[1] = newCovMatrix()
+K.P[2] = newCovMatrix()
+K.P[3] = newCovMatrix()
+
+-- Exported for the render loop
+local predSmoothedVel   = ZERO3
+local predSmoothedAccel = ZERO3
+local predSmoothedJerk  = ZERO3
+
+local function resetPrediction()
+    for i = 1, 3 do
+        K.s[i] = {0, 0, 0, 0}
+        K.P[i] = newCovMatrix()
+    end
+    K.init = false
+    predSmoothedVel   = ZERO3
+    predSmoothedAccel = ZERO3
+    predSmoothedJerk  = ZERO3
+end
+
+-- 4x4 matrix multiply helper (flat arrays, row-major).
+-- Only used during Kalman update — not per-element hot path.
+local function mat4mul(A, B)
+    local C = {}
+    for r = 0, 3 do
+        for c = 0, 3 do
+            local sum = 0
+            for k = 0, 3 do
+                sum = sum + A[r*4 + k + 1] * B[k*4 + c + 1]
+            end
+            C[r*4 + c + 1] = sum
+        end
+    end
+    return C
+end
+
+-- 4x4 matrix transpose (flat arrays)
+local function mat4T(M)
+    return {
+        M[1], M[5], M[9],  M[13],
+        M[2], M[6], M[10], M[14],
+        M[3], M[7], M[11], M[15],
+        M[4], M[8], M[12], M[16],
+    }
+end
+
+-- Runs the full Kalman predict+update for one axis.
+-- Returns nothing; mutates K.s[ax] and K.P[ax] in place.
+local function kalmanAxisUpdate(ax, measurement, dt)
+    local s = K.s[ax]
+    local P = K.P[ax]
+
+    local dt2 = dt * dt
+    local dt3 = dt2 * dt
+    local halfDt2 = dt2 * 0.5
+    local sixthDt3 = dt3 / 6.0
+
+    -- ── PREDICT ──────────────────────────────────────────────────────────────
+    -- State prediction: x_pred = F * x
+    local p_pred = s[1] + s[2]*dt + s[3]*halfDt2 + s[4]*sixthDt3
+    local v_pred = s[2] + s[3]*dt + s[4]*halfDt2
+    local a_pred = s[3] + s[4]*dt
+    local j_pred = s[4]
+
+    -- Covariance prediction: P_pred = F * P * F^T + Q
+    -- Build F matrix
+    local F = {
+        1,  dt,  halfDt2, sixthDt3,
+        0,  1,   dt,      halfDt2,
+        0,  0,   1,       dt,
+        0,  0,   0,       1,
+    }
+    local FT = mat4T(F)
+    local FP = mat4mul(F, P)
+    local PP = mat4mul(FP, FT)
+
+    -- Add process noise Q (diagonal)
+    PP[1]  = PP[1]  + Q_POS
+    PP[6]  = PP[6]  + Q_VEL
+    PP[11] = PP[11] + Q_ACCEL
+    PP[16] = PP[16] + Q_JERK
+
+    -- ── UPDATE ───────────────────────────────────────────────────────────────
+    -- Innovation: y = z - H * x_pred   (H = [1, 0, 0, 0])
+    local innov = measurement - p_pred
+
+    -- Innovation covariance: S = H * P_pred * H^T + R = PP[1] + R
+    local S = PP[1] + R_MEAS
+
+    -- Kalman gain: K = P_pred * H^T / S   → first column of PP / S
+    local K1 = PP[1]  / S
+    local K2 = PP[5]  / S
+    local K3 = PP[9]  / S
+    local K4 = PP[13] / S
+
+    -- State update: x = x_pred + K * innov
+    K.s[ax][1] = p_pred + K1 * innov
+    K.s[ax][2] = v_pred + K2 * innov
+    K.s[ax][3] = a_pred + K3 * innov
+    K.s[ax][4] = j_pred + K4 * innov
+
+    -- Covariance update: P = (I - K*H) * P_pred
+    -- K*H is a 4x4 where only column 1 is non-zero: col1 = [K1,K2,K3,K4]
+    -- (I - K*H)[r][c] = I[r][c] - Kr * H[c] = I[r][c] - Kr * (c==1 ? 1 : 0)
+    -- So only column 1 of (I-KH) differs from identity.
+    local IKH = {
+        1-K1, 0, 0, 0,
+        -K2,  1, 0, 0,
+        -K3,  0, 1, 0,
+        -K4,  0, 0, 1,
+    }
+    K.P[ax] = mat4mul(IKH, PP)
+end
+
+-- Main entry point: feed a world-space position, get back vel, accel, jerk.
 local function updateKalman(meas, dt)
     local mx = {meas.X, meas.Y, meas.Z}
 
     if not K.init then
-        K.pos   = {mx[1], mx[2], mx[3]}
-        K.vel   = {0, 0, 0}
-        K.accel = {0, 0, 0}
-        K.init  = true
-        return ZERO3, ZERO3
+        for i = 1, 3 do
+            K.s[i] = {mx[i], 0, 0, 0}
+            K.P[i] = newCovMatrix()
+        end
+        K.init = true
+        return ZERO3, ZERO3, ZERO3
     end
 
-    local dt2 = dt * dt
-    local halfDt2 = 0.5 * dt2
+    -- Clamp dt to avoid numerical issues
+    local safeDt = mclamp(dt, 0.001, 0.05)
 
     for i = 1, 3 do
-        local p = K.pos[i]
-        local v = K.vel[i]
-        local a = K.accel[i]
-
-        -- Flat P indices: {1=P11, 2=P12, 3=P13, 4=P21, 5=P22, 6=P23, 7=P31, 8=P32, 9=P33}
-        local Pi = K.P[i]
-        local P11,P12,P13 = Pi[1],Pi[2],Pi[3]
-        local P21,P22,P23 = Pi[4],Pi[5],Pi[6]
-        local P31,P32,P33 = Pi[7],Pi[8],Pi[9]
-
-        -- ── Predict state ────────────────────────────────────────────────────
-        local pPred = p + v * dt + a * halfDt2
-        local vPred = v + a * dt
-        local aPred = a  -- constant-acceleration assumption
-
-        -- ── Predict covariance: P_pred = F * P * F^T + Q ─────────────────────
-        -- F = [[1, dt, 0.5*dt²],
-        --      [0,  1,      dt ],
-        --      [0,  0,       1 ]]
-        --
-        -- Rather than full 3x3 matrix multiply, we expand symbolically.
-        -- FP = F * P  (row by column)
-        local FP11 = P11 + dt*P21 + halfDt2*P31
-        local FP12 = P12 + dt*P22 + halfDt2*P32
-        local FP13 = P13 + dt*P23 + halfDt2*P33
-        local FP21 = P21 + dt*P31
-        local FP22 = P22 + dt*P32
-        local FP23 = P23 + dt*P33
-        local FP31 = P31
-        local FP32 = P32
-        local FP33 = P33
-
-        -- PP = FP * F^T  (multiply each row of FP by columns of F^T)
-        -- F^T columns: [1,0,0], [dt,1,0], [0.5dt²,dt,1]
-        local PP11 = FP11 + FP12*dt + FP13*halfDt2 + Q_POS
-        local PP12 = FP12 + FP13*dt
-        local PP13 = FP13
-        local PP21 = FP21 + FP22*dt + FP23*halfDt2
-        local PP22 = FP22 + FP23*dt + Q_VEL
-        local PP23 = FP23
-        local PP31 = FP31 + FP32*dt + FP33*halfDt2
-        local PP32 = FP32 + FP33*dt
-        local PP33 = FP33 + Q_ACCEL
-
-        -- ── Update (observe position: H = [1, 0, 0]) ─────────────────────────
-        local S  = PP11 + R_POS
-        local invS = 1.0 / S
-        local K1 = PP11 * invS
-        local K2 = PP21 * invS
-        local K3 = PP31 * invS
-
-        local innov = mx[i] - pPred
-
-        K.pos[i]   = pPred + K1 * innov
-        K.vel[i]   = vPred + K2 * innov
-        K.accel[i] = aPred + K3 * innov
-
-        -- ── Covariance update: P = (I - K*H) * PP ───────────────────────────
-        -- K*H = [[K1,0,0],[K2,0,0],[K3,0,0]]
-        Pi[1] = PP11 - K1*PP11;  Pi[2] = PP12 - K1*PP12;  Pi[3] = PP13 - K1*PP13
-        Pi[4] = PP21 - K2*PP11;  Pi[5] = PP22 - K2*PP12;  Pi[6] = PP23 - K2*PP13
-        Pi[7] = PP31 - K3*PP11;  Pi[8] = PP32 - K3*PP12;  Pi[9] = PP33 - K3*PP13
+        kalmanAxisUpdate(i, mx[i], safeDt)
     end
 
-    predSmoothedVel   = Vector3.new(K.vel[1],   K.vel[2],   K.vel[3])
-    predSmoothedAccel = Vector3.new(K.accel[1], K.accel[2], K.accel[3])
-    return predSmoothedVel, predSmoothedAccel
+    local estVel   = Vector3.new(K.s[1][2], K.s[2][2], K.s[3][2])
+    local estAccel = Vector3.new(K.s[1][3], K.s[2][3], K.s[3][3])
+    local estJerk  = Vector3.new(K.s[1][4], K.s[2][4], K.s[3][4])
+
+    return estVel, estAccel, estJerk
+end
+
+-- ── Kalman extrapolation helper ──────────────────────────────────────────────
+-- Given the current Kalman state, produce the predicted world-space position
+-- `t` seconds into the future using the full Taylor expansion:
+--   pos + vel*t + 0.5*accel*t² + (1/6)*jerk*t³
+-- This is used for the aim point and is the key improvement over the old
+-- vel*t + 0.5*accel*t² formula.
+local function kalmanExtrapolate(t)
+    local t2 = t * t
+    local t3 = t2 * t
+    return Vector3.new(
+        K.s[1][1] + K.s[1][2]*t + 0.5*K.s[1][3]*t2 + (1/6)*K.s[1][4]*t3,
+        K.s[2][1] + K.s[2][2]*t + 0.5*K.s[2][3]*t2 + (1/6)*K.s[2][4]*t3,
+        K.s[3][1] + K.s[3][2]*t + 0.5*K.s[3][3]*t2 + (1/6)*K.s[3][4]*t3
+    )
+end
+
+-- ============================================================
+-- [5.2] CAMERA / CLIENT VELOCITY TRACKER
+-- ============================================================
+-- Tracks the local player's own movement so prediction can compensate for
+-- relative motion.  Uses a simple EMA on camera position delta.
+local camVelTracker = {
+    lastPos = nil,
+    vel     = ZERO3,    -- smoothed camera velocity (world-space)
+    alpha   = 0.3,      -- EMA smoothing factor (higher = more responsive)
+}
+
+local function updateCameraVelocity(camPos, dt)
+    if camVelTracker.lastPos == nil then
+        camVelTracker.lastPos = camPos
+        return ZERO3
+    end
+
+    local rawVel = (camPos - camVelTracker.lastPos) / mmax(dt, 0.001)
+    camVelTracker.vel = camVelTracker.vel:Lerp(rawVel, camVelTracker.alpha)
+    camVelTracker.lastPos = camPos
+    return camVelTracker.vel
+end
+
+local function resetCameraVelocity()
+    camVelTracker.lastPos = nil
+    camVelTracker.vel     = ZERO3
+end
+
+-- ============================================================
+-- [5.3] TARGET PART OFFSET TRACKER
+-- ============================================================
+-- Tracks the offset from HumanoidRootPart to the target part (e.g. Head)
+-- and smooths it with an EMA.  During jumps/falls/animations the head bobs
+-- relative to the root — this tracker prevents the prediction (which is
+-- computed on the root) from aiming at a stale head position.
+local partOffsetTracker = {
+    offset = ZERO3,
+    alpha  = 0.35,
+    init   = false,
+}
+
+local function updatePartOffset(rootPos, partPos)
+    local raw = partPos - rootPos
+    if not partOffsetTracker.init then
+        partOffsetTracker.offset = raw
+        partOffsetTracker.init   = true
+    else
+        partOffsetTracker.offset = partOffsetTracker.offset:Lerp(raw, partOffsetTracker.alpha)
+    end
+    return partOffsetTracker.offset
+end
+
+local function resetPartOffset()
+    partOffsetTracker.offset = ZERO3
+    partOffsetTracker.init   = false
 end
 
 -- ── Seeded fBm value noise ────────────────────────────────────────────────────
--- NOISE_TABLE, hashLookup, catmullRom, valueNoise1D are all confined to this
--- do block.  Only `smoothNoise` escapes as a chunk-level upvalue, saving four
--- chunk-level local slots (NOISE_TABLE + 3 helper functions).
 local smoothNoise
 do
     local NOISE_TABLE = {}
     for i = 1, 256 do
-        NOISE_TABLE[i] = mrand() * 2 - 1  -- uniform in [-1, 1]
+        NOISE_TABLE[i] = mrand() * 2 - 1
     end
 
     local function hashLookup(i)
@@ -801,8 +817,6 @@ do
             hashLookup(i+1), hashLookup(i+2), frac), -1, 1)
     end
 
-    -- 4-octave fBm: persistence 0.5, lacunarity 2.0.
-    -- Total weight sum = 0.9375; normalised to [-1, 1].
     smoothNoise = function(x)
         return mclamp(
             ( valueNoise1D(x)       * 0.5
@@ -813,30 +827,23 @@ do
     end
 end
 
--- ── Improved alertness system ─────────────────────────────────────────────────
--- Tracks engagement duration, distance, and a fatigue component rather than a
--- simple ±constant per-second tick.  Updates 10× per second for smoother ramp.
-local trackingStartTime  = 0     -- tick() when current target was first locked
-local lastTargetLostTime = 0     -- tick() when we last had a target (for decay rate)
-local trackingDistance   = 200   -- world distance to current target (updated per frame)
+-- ── Alertness system ──────────────────────────────────────────────────────────
+local trackingStartTime  = 0
+local lastTargetLostTime = 0
+local trackingDistance   = 200
 
--- FIX: Store the thread reference so it can be cancelled when the GUI is
--- destroyed (prevents orphaned threads accumulating on re-runs / resets).
 local alertnessThread = task.spawn(function()
     while true do
-        task.wait(0.1)   -- 10 Hz for smooth ramp
+        task.wait(0.1)
         if currentTarget == nil then
-            -- Fast post-combat decay for a couple of seconds, then slow idle decay.
             local timeSinceLost = tick() - lastTargetLostTime
             local decayRate = timeSinceLost < 3.0 and 0.02 or 0.008
             alertnessLevel = mmax(0.2, alertnessLevel - decayRate)
         else
-            -- Ramp is faster for nearby targets and accelerates over the first 5 s.
             local distFactor    = mclamp(1.0 - trackingDistance / mmax(Settings.MaxDistance, 1), 0.2, 1.0)
             local engageSecs    = tick() - trackingStartTime
             local durationBoost = mclamp(engageSecs / 5.0, 0, 0.5)
             local rampRate      = 0.015 * distFactor * (1.0 + durationBoost)
-            -- Fatigue: very long continuous engagement slightly dulls alertness.
             if engageSecs > 30 then
                 rampRate = rampRate * mclamp(1.0 - (engageSecs - 30) * 0.01, 0.6, 1.0)
             end
@@ -846,20 +853,16 @@ local alertnessThread = task.spawn(function()
 end)
 
 -- ── Reaction time (Box-Muller) ────────────────────────────────────────────────
--- Std dev now scales with alertness: an alert player reacts consistently;
--- a drowsy one is both slower AND more variable.
 local function generateReactionTime()
     local u1 = mmax(mrand(), 1e-10)
     local u2 = mrand()
     local stdNormal = msqrt(-2.0 * mlog(u1)) * mcos(TAU * u2)
-    -- σ in [0.03 s, 0.07 s] — widest spread when alertness is at floor (0.2).
     local stdDev  = 0.03 + (1.0 - alertnessLevel) * 0.05
     local reaction  = Settings.MeanReactionTime + (stdNormal * stdDev)
     local modifier  = 1.0 - (alertnessLevel * 0.3)
     return mclamp(reaction * modifier, Settings.MinReactionTime, Settings.MaxReactionTime)
 end
 
--- Re-acquisition: switching back to a target seen in the last 2 s is faster.
 local recentTargetPlayer  = nil
 local recentTargetLostAt  = -math.huge
 
@@ -874,15 +877,15 @@ local function onNewTargetAcquired(newTarget, now)
         isReacting         = true
 
         local baseReact = generateReactionTime()
-        -- Re-acquisitions are ~45% faster (muscle memory / still on-screen)
         reactionEndTime = now + (isReacq and baseReact * 0.55 or baseReact)
 
         resetSpring()
         resetPrediction()
+        resetCameraVelocity()
+        resetPartOffset()
     end
 end
 
--- FIX: Accept pre-cached `now` to avoid a redundant tick() call per frame.
 local function shouldWaitForReaction(now)
     if Settings.Mode ~= "Legit" then return false end
     if isReacting then
@@ -895,22 +898,16 @@ local function shouldWaitForReaction(now)
     return false
 end
 
--- ── Humanised tracking: Ornstein-Uhlenbeck bias + fBm shake ──────────────────
--- The old code lerped aimOffset back to ZERO3 every frame so bias always
--- collapsed to centre.  Real grip/wrist bias has a non-zero mean that
--- wanders slowly.  We model this as an Ornstein-Uhlenbeck process: a random
--- walk with weak mean-reversion so it drifts without diverging.
-local aimBiasCenter     = ZERO3  -- the wandering "resting point" of the bias
-local aimOffset         = ZERO3  -- current bias (chases aimBiasCenter with lag)
+-- ── Humanised tracking ────────────────────────────────────────────────────────
+local aimBiasCenter     = ZERO3
+local aimOffset         = ZERO3
 local targetVelocityLag = ZERO3
 local shakeTime         = 0
 
--- OU parameters (inlined below as 0.005 / 0.004 to save two chunk-level slots)
 local function generateAimError(targetVelocity, distanceToTarget, dt)
     local df   = mclamp(distanceToTarget / Settings.MaxDistance, 0, 1)
     local dErr = df * df * Settings.TrackingError
 
-    -- Velocity lag
     local velMag = targetVelocity.Magnitude
     if velMag > 0.1 then
         targetVelocityLag = targetVelocityLag:Lerp(
@@ -919,7 +916,6 @@ local function generateAimError(targetVelocity, distanceToTarget, dt)
         targetVelocityLag = targetVelocityLag:Lerp(ZERO3, 0.2)
     end
 
-    -- fBm shake (4-octave seeded noise, unique per session)
     shakeTime = shakeTime + dt * Settings.ShakeIntensity
     local shake = Vector3.new(
         smoothNoise(shakeTime * 6.5)       * dErr * 0.5,
@@ -927,17 +923,13 @@ local function generateAimError(targetVelocity, distanceToTarget, dt)
         smoothNoise(shakeTime * 5.8 + 200) * dErr * 0.3
     )
 
-    -- Ornstein-Uhlenbeck bias center: drifts randomly with weak pull to origin.
-    -- Scaled by dErr so bias is larger at long range (harder to hold aim).
-    -- OU_REVERSION=0.005, OU_DIFFUSION=0.004 inlined.
     local diff = 0.004 * dErr
     aimBiasCenter = aimBiasCenter * (1 - 0.005) + Vector3.new(
         (mrand() - 0.5) * diff,
         (mrand() - 0.5) * diff,
-        (mrand() - 0.5) * diff * 0.4  -- smaller Z drift (depth axis)
+        (mrand() - 0.5) * diff * 0.4
     )
 
-    -- aimOffset lags behind the wandering centre — simulates muscle inertia.
     aimOffset = aimOffset:Lerp(aimBiasCenter, 0.06)
 
     return shake + aimOffset - targetVelocityLag
@@ -948,7 +940,6 @@ end
 -- ============================================================
 local cachedPing = 0
 
--- FIX: Store thread reference for cleanup (see ScreenGui.Destroying in [7]).
 local pingThread = task.spawn(function()
     while true do
         task.wait(0.5)
