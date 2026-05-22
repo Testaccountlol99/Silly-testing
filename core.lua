@@ -486,6 +486,7 @@ local function getClosestTarget(now)
         local pTeam = player.Team
         if myTeam and pTeam == myTeam then continue end
         if pTeam and wlTeams[pTeam.Name] then continue end
+        if game.GameId == 113217312262185 and player:FindFirstChild("HoverHighlight") and player:FindFirstChild("HoverHighlight") .OutlineColor == Color3.fromRGB(0, 255, 0) then continue end
 
         -- Use cached character context — eliminates FindFirstChildOfClass("Humanoid")
         -- and FindFirstChild("HumanoidRootPart") per player per frame
